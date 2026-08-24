@@ -9,7 +9,7 @@ use positioned_io::ReadAt;
 use snafu::OptionExt;
 
 use crate::page::{Layout, PageCodec, PageEntry, PageTable};
-use crate::read::{BadPageTableSnafu, Result, at, be32};
+use crate::read::{BadPageTableSnafu, MAX_PREALLOC, Result, at, be32};
 
 /// The seven bytes that mark the end of a `CFS0002` trailer.
 pub const SIGNATURE: &[u8] = b"CFS0002";
@@ -51,7 +51,7 @@ pub fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout> {
     let page_uncompressed: Vec<u32> = (0..page_count).map(|i| be32(&meta, i * 16 + 8)).collect();
 
     let mut offset = pages_at;
-    let mut entries = Vec::with_capacity(page_count);
+    let mut entries = Vec::with_capacity(page_count.min(MAX_PREALLOC));
     for i in 0..page_count {
         entries.push(PageEntry {
             offset,

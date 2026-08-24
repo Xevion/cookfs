@@ -8,7 +8,7 @@ use la_arena::Arena;
 pub use la_arena::Idx;
 use snafu::ensure;
 
-use crate::read::{BadMagicSnafu, Cursor, DesyncSnafu, FSINDEX_MAGIC, Result};
+use crate::read::{BadMagicSnafu, Cursor, DesyncSnafu, FSINDEX_MAGIC, MAX_PREALLOC, Result};
 
 /// One compressed byte range that a file's contents span.
 #[derive(Debug, Clone, Copy)]
@@ -148,11 +148,6 @@ impl Index {
 }
 
 const DIR_MARKER: i32 = -1;
-
-/// Cap for `Vec::with_capacity` from untrusted count fields; the vector grows
-/// naturally past this bound, but a crafted count cannot force a huge
-/// pre-allocation before the cursor errors on missing bytes.
-const MAX_PREALLOC: usize = 1024;
 
 fn read_dir(
     cursor: &mut Cursor<'_>,

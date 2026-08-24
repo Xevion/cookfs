@@ -14,7 +14,7 @@ use snafu::OptionExt;
 
 use crate::codec::{self, Codec};
 use crate::page::{Layout, PageCodec, PageEntry, PageTable};
-use crate::read::{BadPageTableSnafu, Cursor, Result, at};
+use crate::read::{BadPageTableSnafu, Cursor, MAX_PREALLOC, Result, at};
 
 /// The seven bytes that mark the end of a `CFS0003` trailer.
 pub const SIGNATURE: &[u8] = b"CFS0003";
@@ -155,11 +155,12 @@ impl PgIndex {
         c.take(page_count)?; // per-page compression level, unused
         c.take(page_count)?; // per-page encryption flag, unused
 
-        let mut size_compressed = Vec::with_capacity(page_count);
+        let cap = page_count.min(MAX_PREALLOC);
+        let mut size_compressed = Vec::with_capacity(cap);
         for _ in 0..page_count {
             size_compressed.push(c.be32()?);
         }
-        let mut size_uncompressed = Vec::with_capacity(page_count);
+        let mut size_uncompressed = Vec::with_capacity(cap);
         for _ in 0..page_count {
             size_uncompressed.push(c.be32()?);
         }
@@ -372,6 +373,14 @@ mod tests {
     fn pgindex_errors_instead_of_panicking_on_truncation() {
         let mut blob = pgindex_blob(&[3, 0], &[100, 200], &[50, 150]);
         blob.truncate(blob.len() - 5);
+        check!(let Err(crate::Error::Truncated { .. }) = PgIndex::parse(&blob));
+    }
+
+    /// A crafted page count must not force a multi-GB pre-allocation; the
+    /// cursor's next take errors on missing bytes long before it matters.
+    #[test]
+    fn pgindex_rejects_a_crafted_page_count_without_oom() {
+        let blob = u32::MAX.to_be_bytes().to_vec();
         check!(let Err(crate::Error::Truncated { .. }) = PgIndex::parse(&blob));
     }
 }

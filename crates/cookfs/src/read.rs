@@ -14,6 +14,11 @@ use snafu::{OptionExt, ResultExt, Snafu};
 /// every format this crate reads.
 pub const FSINDEX_MAGIC: &[u8] = b"CFS2.200";
 
+/// Cap for `Vec::with_capacity` from untrusted count fields; the vector still
+/// grows past this bound, but a crafted count cannot force a huge pre-alloc
+/// before the source runs out of bytes.
+pub const MAX_PREALLOC: usize = 1024;
+
 /// Everything that can go wrong reading a cookfs archive.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
