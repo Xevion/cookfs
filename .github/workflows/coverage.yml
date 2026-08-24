@@ -39,6 +39,7 @@ jobs:
         if: ${{ env.S3_ACCESS_KEY_ID != '' }}
         run: bun run tools/corpus.ts pull
       - name: Run tests with coverage
+        id: coverage
         run: |
           mkdir -p coverage
           cargo llvm-cov nextest --workspace --all-features --no-fail-fast \
@@ -52,14 +53,16 @@ jobs:
           retention-days: 7
       # Codecov rejects tokenless uploads outright, so without the token these skip rather than
       # erroring into a green run. With it, a broken upload fails the job instead of going quiet.
+      # Failing tests still upload; a run that never produced a report does not, since Codecov
+      # reports a missing test-results file as success and would hide the real failure.
       - name: Upload coverage to Codecov
-        if: ${{ !cancelled() && env.CODECOV_TOKEN != '' }}
+        if: ${{ !cancelled() && env.CODECOV_TOKEN != '' && steps.coverage.outcome != 'skipped' }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: coverage/lcov.info
           fail_ci_if_error: true
       - name: Upload test results to Codecov
-        if: ${{ !cancelled() && env.CODECOV_TOKEN != '' }}
+        if: ${{ !cancelled() && env.CODECOV_TOKEN != '' && steps.coverage.outcome != 'skipped' }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: target/nextest/ci/junit.xml

@@ -1,6 +1,7 @@
 [tools]
 bun = "1.4.0"
-"npm:@xevion/tempo" = "latest"
+# Opts out of aube's download-count gate, which fails the whole install where CI cannot confirm.
+"npm:@xevion/tempo" = { version = "latest", allow_low_downloads = true }
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.143"
 "aqua:taiki-e/cargo-llvm-cov" = "0.9.0"
 "aqua:zizmorcore/zizmor" = "1.29.0"
