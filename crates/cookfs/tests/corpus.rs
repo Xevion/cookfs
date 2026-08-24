@@ -3,74 +3,12 @@
 //! An absent corpus skips; one that is present but wrong fails. Collapsing those two would let a
 //! run that checked nothing report green.
 
-use std::env;
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use assert2::check;
-
-/// Overrides where samples live; the corpus tool reads the same variable.
-const DIR_ENV: &str = "COOKFS_CORPUS_DIR";
-
-#[derive(Debug)]
-struct Sample {
-    name: String,
-    sha256: String,
-    size: u64,
-    format: String,
-    container: String,
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate manifest lives two levels under the workspace root")
-        .to_path_buf()
-}
-
-fn samples_dir() -> PathBuf {
-    env::var(DIR_ENV).map_or_else(|_| workspace_root().join("samples"), PathBuf::from)
-}
-
-fn manifest() -> Vec<Sample> {
-    let path = workspace_root().join("corpus.toml");
-    let text =
-        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    let table: toml::Table = text
-        .parse()
-        .unwrap_or_else(|e| panic!("{} is not valid TOML: {e}", path.display()));
-
-    let entries = table
-        .get("sample")
-        .and_then(toml::Value::as_array)
-        .unwrap_or_else(|| panic!("{} declares no [[sample]] entries", path.display()));
-
-    let field = |entry: &toml::Value, key: &str| -> String {
-        entry
-            .get(key)
-            .and_then(toml::Value::as_str)
-            .unwrap_or_else(|| panic!("a [[sample]] in {} has no `{key}`", path.display()))
-            .to_owned()
-    };
-
-    entries
-        .iter()
-        .map(|entry| Sample {
-            name: field(entry, "name"),
-            sha256: field(entry, "sha256"),
-            format: field(entry, "format"),
-            container: field(entry, "container"),
-            size: entry
-                .get("size")
-                .and_then(toml::Value::as_integer)
-                .and_then(|n| u64::try_from(n).ok())
-                .unwrap_or_else(|| {
-                    panic!("a [[sample]] in {} has no usable `size`", path.display())
-                }),
-        })
-        .collect()
-}
+use common::{manifest, samples_dir};
 
 #[test]
 fn the_manifest_is_well_formed() {

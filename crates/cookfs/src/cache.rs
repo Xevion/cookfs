@@ -42,9 +42,8 @@ impl Budget {
         let mean = (uncompressed.iter().map(|&s| u64::from(s)).sum::<u64>() / count as u64).max(1);
         let want = (2 * workers as u64 * mean).clamp(Self::FLOOR, Self::CEILING);
         Self {
-            // `count.max(2)` keeps the upper bound above the lower one: an
-            // archive with a single page (or none) would otherwise clamp with
-            // min > max, which panics.
+            // `count.max(2)` keeps the upper bound above the lower: a single-page
+            // archive would otherwise clamp with min > max, which panics.
             pages: ((want / mean) as usize).clamp(2, count.max(2)),
         }
     }
