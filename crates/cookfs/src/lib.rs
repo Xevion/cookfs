@@ -1,11 +1,5 @@
 //! cookfs, the page-based Tcl virtual filesystem archive format.
 
-#[cfg(test)]
-mod tests {
-    use assert2::check;
+pub mod cache;
 
-    #[test]
-    fn smoke() {
-        check!(size_of::<usize>() >= 4);
-    }
-}
+pub use cache::{Budget, Page, PageCache};
