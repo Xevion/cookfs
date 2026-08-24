@@ -13,3 +13,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+assert2.workspace = true
+proptest.workspace = true
+rstest.workspace = true
+toml.workspace = true

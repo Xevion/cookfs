@@ -1,0 +1,59 @@
+name: security
+
+on:
+  push:
+    branches: [master] # PR branches run via pull_request; avoids the double run
+  pull_request:
+  schedule:
+    - cron: "0 12 * * 1" # weekly, so a new advisory surfaces without a push
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  workflows:
+    name: workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        uses: ./.github/actions/setup
+        with:
+          cache: "false"
+      # The pin audits resolve `uses:` SHAs against GitHub and silently skip without a token.
+      - name: Audit workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just zizmor
+
+  advisories:
+    name: advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        uses: ./.github/actions/setup
+        with:
+          cache: "false"
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
+        with:
+          tool: cargo-audit
+      # Cargo.lock is not committed, so the scan resolves its own.
+      - name: Resolve dependencies
+        run: cargo generate-lockfile
+      - name: Scan for advisories
+        run: cargo audit

@@ -1,0 +1,11 @@
+[profile.default]
+fail-fast = false
+
+# For the coverage workflow, which uploads this junit report to Codecov beside the lcov one.
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+store-failure-output = true
+store-success-output = false

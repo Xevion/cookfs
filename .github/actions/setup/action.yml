@@ -1,0 +1,17 @@
+name: setup
+description: Install the mise-managed tools and restore the cargo cache. Rust itself comes from rust-toolchain.toml, which rustup reads on the first cargo invocation.
+
+inputs:
+  cache:
+    description: Restore and save the cargo build cache.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Install tools
+      uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+    - name: Cache cargo
+      if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

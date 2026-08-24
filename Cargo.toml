@@ -8,6 +8,12 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/Xevion/cookfs"
 
+[workspace.dependencies]
+assert2 = "0.4.0"
+proptest = "1.11.0"
+rstest = "0.26.1"
+toml = "1.1.4"
+
 [workspace.lints.rust]
 missing_docs = "warn"
 unused_lifetimes = "warn"

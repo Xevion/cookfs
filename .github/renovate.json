@@ -1,0 +1,80 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits"
+  ],
+  "timezone": "America/Chicago",
+  "schedule": ["before 6am on monday"],
+  "minimumReleaseAge": "5 days",
+  "internalChecksFilter": "strict",
+  "branchNameStrict": true,
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["dependencies", "security"],
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null
+  },
+  "osvVulnerabilityAlerts": true,
+  "packageRules": [
+    {
+      "description": "Cargo: group non-major updates into one PR",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "rust (non-major)",
+      "addLabels": ["rust"]
+    },
+    {
+      "description": "Pre-1.0 minor bumps are breaking under Cargo semver: individual PRs so one blocked migration can't stall the rest",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": "<1.0.0",
+      "groupName": null
+    },
+    {
+      "description": "Rust major bumps: individual PRs, manual review",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["rust", "major"]
+    },
+    {
+      "description": "GitHub Actions: group and automerge non-major (CI-gated)",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "github-actions",
+      "addLabels": ["github-actions"],
+      "automerge": true
+    },
+    {
+      "description": "GitHub Actions majors: individual PRs, manual review",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["github-actions", "major"]
+    },
+    {
+      "description": "The toolchain pin and the mise-managed tools move together, since CI runs what mise installs against the pinned rustc",
+      "matchManagers": ["mise", "custom.regex"],
+      "groupName": "toolchain",
+      "addLabels": ["toolchain"]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the Rust toolchain channel in rust-toolchain.toml",
+      "managerFilePatterns": ["/(^|/)rust-toolchain\\.toml$/"],
+      "matchStrings": ["channel\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "rust",
+      "versioningTemplate": "docker"
+    }
+  ]
+}

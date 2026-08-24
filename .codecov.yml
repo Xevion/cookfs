@@ -1,0 +1,42 @@
+codecov:
+  notify:
+    wait_for_ci: true
+
+# Informational: both statuses post a number and never fail a check. Coverage is a trend to read;
+# the gate is `just check`.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+        target: auto
+        threshold: 2%
+        branches:
+          - master
+    patch:
+      default:
+        informational: true
+
+component_management:
+  individual_components:
+    - component_id: cookfs
+      name: cookfs
+      paths:
+        - crates/cookfs/**
+    - component_id: metakit
+      name: metakit
+      paths:
+        - crates/metakit/**
+    - component_id: bitrock
+      name: bitrock
+      paths:
+        - crates/bitrock/**
+
+comment:
+  layout: "condensed_header, diff, components, condensed_footer"
+  behavior: default
+  require_changes: coverage_drop
+  hide_project_coverage: false
+
+github_checks:
+  annotations: true

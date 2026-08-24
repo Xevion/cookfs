@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [master] # PR branches run via pull_request; avoids the double run
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR runs for a ref supersede each other. A master push gets a group of its own, so a pushed stack
+# never loses a commit's verdict to the one behind it.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        uses: ./.github/actions/setup
+      - name: Check formatting
+        run: just fmt-check
+      - name: Clippy
+        run: just clippy
+      - name: Lint docs
+        run: just doc
+
+  test:
+    name: test (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, platform: linux-x64 }
+          - { runner: macos-14, platform: macos-arm64 }
+          - { runner: windows-2022, platform: windows-x64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: "1"
+      AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+      AWS_REGION: auto
+      S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        uses: ./.github/actions/setup
+      # Secrets can't gate an `if`, so a repo variable stands in: forks without the corpus
+      # credentials, and the two non-Linux runners, run the suite's skip path instead.
+      - name: Fetch sample corpus
+        if: ${{ runner.os == 'Linux' && vars.S3_CORPUS_CONFIGURED == 'true' }}
+        uses: ./.github/actions/fetch-corpus
+      - name: Run tests
+        run: just test
