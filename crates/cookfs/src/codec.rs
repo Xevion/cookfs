@@ -23,18 +23,21 @@ pub enum Codec {
     Stored,
     /// zlib/deflate (id 1).
     Deflate,
-    /// bzip2 (id 2). Not yet decodable by this build.
+    /// bzip2 (id 2). Requires the `codec-bzip2` feature, on by default.
     Bzip2,
     /// Raw LZMA1 (id 3): `CFS0003`'s own codec, distinct from BitRock's
     /// `.lzma`-alone container at id 255 despite sharing an algorithm.
     Lzma,
-    /// Zstandard (id 4). Not yet decodable by this build.
+    /// Zstandard (id 4). Requires the `codec-zstd` feature, on by default.
     Zstd,
-    /// Brotli (id 5). Not yet decodable by this build.
+    /// Brotli (id 5). Requires the `codec-brotli` feature, on by default.
     Brotli,
     /// BitRock's legacy LZMA-alone codec, wired into the custom slot (id 255).
     LegacyCustom,
-    /// The modern custom codec slot (id 254). Not yet decodable by this build.
+    /// The modern custom codec slot (id 254).
+    ///
+    /// Support would require a caller-supplied decoder; no such extension
+    /// point is exposed yet, so this variant always decodes as unavailable.
     ModernCustom,
 }
 
@@ -76,9 +79,10 @@ impl Codec {
 
 /// Decodes one blob: a leading 1-byte codec id, then the compressed payload.
 ///
-/// `uncompressed_len` is the blob's own declared decompressed size; only
-/// [`Codec::Lzma`] needs it, since a raw LZMA1 stream has no end-of-stream
-/// marker to decode toward.
+/// `uncompressed_len` is the blob's own declared decompressed size. Every
+/// codec's read is bounded to this length so a decompression bomb from
+/// untrusted input cannot exhaust memory, and [`Codec::Lzma`] additionally
+/// relies on it as the termination signal a raw LZMA1 stream lacks.
 ///
 /// # Errors
 ///
@@ -95,9 +99,10 @@ pub fn decode(blob: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
 ///
 /// `CFS0003` names each page's codec out of band, in the pgindex table, so
 /// its page and index blobs carry no leading id byte for [`decode`] to strip.
-/// `uncompressed_len` is the blob's own declared decompressed size; only
-/// [`Codec::Lzma`] needs it, since a raw LZMA1 stream has no end-of-stream
-/// marker to decode toward.
+/// `uncompressed_len` is the blob's own declared decompressed size. Every
+/// codec's read is bounded to this length so a decompression bomb from
+/// untrusted input cannot exhaust memory, and [`Codec::Lzma`] additionally
+/// relies on it as the termination signal a raw LZMA1 stream lacks.
 ///
 /// # Errors
 ///
@@ -107,11 +112,20 @@ pub fn decode(blob: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
 pub fn decode_with(codec: Codec, body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
     match codec {
         Codec::Stored => Ok(body.to_vec()),
-        Codec::Deflate => decode_deflate(body),
+        Codec::Deflate => decode_deflate(body, uncompressed_len),
         Codec::Lzma => decode_raw_lzma1(body, uncompressed_len),
-        Codec::LegacyCustom => decode_lzma_alone(body),
+        Codec::LegacyCustom => decode_lzma_alone(body, uncompressed_len),
+        #[cfg(feature = "codec-bzip2")]
+        Codec::Bzip2 => decode_bzip2(body, uncompressed_len),
+        #[cfg(not(feature = "codec-bzip2"))]
         codec @ Codec::Bzip2 => unavailable(codec, "bzip2"),
+        #[cfg(feature = "codec-zstd")]
+        Codec::Zstd => decode_zstd(body, uncompressed_len),
+        #[cfg(not(feature = "codec-zstd"))]
         codec @ Codec::Zstd => unavailable(codec, "zstd"),
+        #[cfg(feature = "codec-brotli")]
+        Codec::Brotli => decode_brotli(body, uncompressed_len),
+        #[cfg(not(feature = "codec-brotli"))]
         codec @ Codec::Brotli => unavailable(codec, "brotli"),
         codec @ Codec::ModernCustom => unavailable(codec, "modern-custom"),
     }
@@ -125,23 +139,60 @@ fn unavailable(codec: Codec, feature: &'static str) -> Result<Vec<u8>> {
     .fail()
 }
 
-fn decode_deflate(body: &[u8]) -> Result<Vec<u8>> {
+/// The read is bounded to `uncompressed_len` so a decompression bomb from
+/// untrusted input cannot exhaust memory even when the codec reports its own
+/// end-of-stream cleanly.
+fn decode_deflate(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     flate2::read::DeflateDecoder::new(body)
+        .take(uncompressed_len as u64)
         .read_to_end(&mut out)
         .context(DecompressSnafu { codec: "deflate" })?;
+    Ok(out)
+}
+
+#[cfg(feature = "codec-bzip2")]
+fn decode_bzip2(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    bzip2::read::BzDecoder::new(body)
+        .take(uncompressed_len as u64)
+        .read_to_end(&mut out)
+        .context(DecompressSnafu { codec: "bzip2" })?;
+    Ok(out)
+}
+
+#[cfg(feature = "codec-zstd")]
+fn decode_zstd(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    zstd::stream::read::Decoder::new(body)
+        .context(DecompressSnafu { codec: "zstd" })?
+        .take(uncompressed_len as u64)
+        .read_to_end(&mut out)
+        .context(DecompressSnafu { codec: "zstd" })?;
+    Ok(out)
+}
+
+#[cfg(feature = "codec-brotli")]
+fn decode_brotli(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+    const BUFFER_SIZE: usize = 4096;
+    let mut out = Vec::new();
+    brotli::Decompressor::new(body, BUFFER_SIZE)
+        .take(uncompressed_len as u64)
+        .read_to_end(&mut out)
+        .context(DecompressSnafu { codec: "brotli" })?;
     Ok(out)
 }
 
 /// BitRock's legacy custom slot (id 255): the classic `.lzma`-alone
 /// container, a 13-byte header (properties, dictionary size, uncompressed
 /// size) that `liblzma`'s alone decoder consumes itself.
-fn decode_lzma_alone(body: &[u8]) -> Result<Vec<u8>> {
+fn decode_lzma_alone(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
         .map_err(std::io::Error::other)
         .context(DecompressSnafu { codec: "lzma" })?;
     liblzma::read::XzDecoder::new_stream(body, stream)
+        .take(uncompressed_len as u64)
         .read_to_end(&mut out)
         .context(DecompressSnafu { codec: "lzma" })?;
     Ok(out)
@@ -183,6 +234,8 @@ fn decode_raw_lzma1(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use assert2::check;
+    #[cfg(any(feature = "codec-zstd", feature = "codec-brotli"))]
+    use std::io::Write;
 
     #[test]
     fn from_id_maps_every_known_id_to_its_variant() {
@@ -299,12 +352,115 @@ mod tests {
     }
 
     #[test]
-    fn decode_of_unimplemented_codecs_reports_unavailable() {
-        for id in [2u8, 4, 5, 254] {
-            let blob = vec![id, 0, 1, 2, 3];
-            let err = decode(&blob, 3).unwrap_err();
-            check!(matches!(err, crate::Error::CodecUnavailable { id: got, .. } if got == id));
-        }
+    fn decode_of_modern_custom_reports_unavailable() {
+        let blob = vec![254u8, 0, 1, 2, 3];
+        let err = decode(&blob, 3).unwrap_err();
+        check!(matches!(
+            err,
+            crate::Error::CodecUnavailable { id: 254, .. }
+        ));
+    }
+
+    #[cfg(feature = "codec-bzip2")]
+    #[test]
+    fn decode_of_bzip2_round_trips_a_known_stream() {
+        let mut compressed = Vec::new();
+        bzip2::read::BzEncoder::new(
+            &b"the quick brown fox jumps over the lazy dog"[..],
+            bzip2::Compression::default(),
+        )
+        .read_to_end(&mut compressed)
+        .unwrap();
+
+        let mut blob = vec![2u8];
+        blob.extend_from_slice(&compressed);
+        check!(decode(&blob, 44).unwrap() == b"the quick brown fox jumps over the lazy dog");
+    }
+
+    #[cfg(feature = "codec-bzip2")]
+    #[test]
+    fn decode_with_bzip2_round_trips_without_a_leading_byte() {
+        let mut compressed = Vec::new();
+        bzip2::read::BzEncoder::new(
+            &b"externally-coded payload"[..],
+            bzip2::Compression::default(),
+        )
+        .read_to_end(&mut compressed)
+        .unwrap();
+
+        check!(decode_with(Codec::Bzip2, &compressed, 25).unwrap() == b"externally-coded payload");
+    }
+
+    #[cfg(not(feature = "codec-bzip2"))]
+    #[test]
+    fn decode_of_bzip2_reports_unavailable_when_feature_off() {
+        let blob = vec![2u8, 0, 1, 2, 3];
+        let err = decode(&blob, 3).unwrap_err();
+        check!(matches!(err, crate::Error::CodecUnavailable { id: 2, .. }));
+    }
+
+    #[cfg(feature = "codec-zstd")]
+    #[test]
+    fn decode_of_zstd_round_trips_a_known_stream() {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        encoder
+            .write_all(b"the quick brown fox jumps over the lazy dog")
+            .unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut blob = vec![4u8];
+        blob.extend_from_slice(&compressed);
+        check!(decode(&blob, 44).unwrap() == b"the quick brown fox jumps over the lazy dog");
+    }
+
+    #[cfg(feature = "codec-zstd")]
+    #[test]
+    fn decode_with_zstd_round_trips_without_a_leading_byte() {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        encoder.write_all(b"externally-coded payload").unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        check!(decode_with(Codec::Zstd, &compressed, 25).unwrap() == b"externally-coded payload");
+    }
+
+    #[cfg(not(feature = "codec-zstd"))]
+    #[test]
+    fn decode_of_zstd_reports_unavailable_when_feature_off() {
+        let blob = vec![4u8, 0, 1, 2, 3];
+        let err = decode(&blob, 3).unwrap_err();
+        check!(matches!(err, crate::Error::CodecUnavailable { id: 4, .. }));
+    }
+
+    #[cfg(feature = "codec-brotli")]
+    #[test]
+    fn decode_of_brotli_round_trips_a_known_stream() {
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 9, 22);
+        encoder
+            .write_all(b"the quick brown fox jumps over the lazy dog")
+            .unwrap();
+        let compressed = encoder.into_inner();
+
+        let mut blob = vec![5u8];
+        blob.extend_from_slice(&compressed);
+        check!(decode(&blob, 44).unwrap() == b"the quick brown fox jumps over the lazy dog");
+    }
+
+    #[cfg(feature = "codec-brotli")]
+    #[test]
+    fn decode_with_brotli_round_trips_without_a_leading_byte() {
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 9, 22);
+        encoder.write_all(b"externally-coded payload").unwrap();
+        let compressed = encoder.into_inner();
+
+        check!(decode_with(Codec::Brotli, &compressed, 25).unwrap() == b"externally-coded payload");
+    }
+
+    #[cfg(not(feature = "codec-brotli"))]
+    #[test]
+    fn decode_of_brotli_reports_unavailable_when_feature_off() {
+        let blob = vec![5u8, 0, 1, 2, 3];
+        let err = decode(&blob, 3).unwrap_err();
+        check!(matches!(err, crate::Error::CodecUnavailable { id: 5, .. }));
     }
 
     #[test]
