@@ -59,10 +59,10 @@ jobs:
           persist-credentials: false
       - name: Install toolchain
         uses: ./.github/actions/setup
-      # Secrets can't gate an `if`, so a repo variable stands in: forks without the corpus
+      # `secrets` can't gate an `if`, but the job env it populates can: forks without the corpus
       # credentials, and the two non-Linux runners, run the suite's skip path instead.
       - name: Fetch sample corpus
-        if: ${{ runner.os == 'Linux' && vars.S3_CORPUS_CONFIGURED == 'true' }}
+        if: ${{ runner.os == 'Linux' && env.AWS_ACCESS_KEY_ID != '' }}
         uses: ./.github/actions/fetch-corpus
       - name: Run tests
         run: just test
