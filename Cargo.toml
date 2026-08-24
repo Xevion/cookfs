@@ -1,0 +1,12 @@
+[package]
+name = "cookfs"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+description = "cookfs, the page-based Tcl virtual filesystem archive embedded in tclkit binaries and InstallBuilder installers"
+repository = "https://github.com/Xevion/cookfs"
+readme = "README.md"
+keywords = ["cookfs", "tcl", "vfs", "archive", "installbuilder"]
+categories = ["filesystem", "compression"]
+
+[dependencies]
