@@ -3,7 +3,6 @@ resolver = "3"
 members = ["crates/cookfs", "crates/metakit", "crates/bitrock"]
 
 [workspace.package]
-version = "0.0.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Xevion/cookfs"

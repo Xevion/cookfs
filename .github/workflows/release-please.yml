@@ -1,0 +1,31 @@
+# Maintains a release PR per crate and, on merge, tags + cuts the GitHub Release for whichever
+# crates had conventional commits since their last release. Gated on `ci` succeeding on master so
+# a release PR never advances to reflect a red tree. Runs under a PAT (RELEASE_PLEASE_TOKEN): a
+# Release created by the default GITHUB_TOKEN cannot trigger other workflows, and the `release.yml`
+# publish job keys off the `release: published` event.
+
+name: release-please
+
+# Safe despite workflow_run: this checks out nothing and only fires for `ci` on master.
+on: # zizmor: ignore[dangerous-triggers]
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Release PR
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/release-please-manifest.json

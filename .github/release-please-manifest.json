@@ -1,0 +1,5 @@
+{
+	"crates/cookfs": "0.0.0",
+	"crates/metakit": "0.0.0",
+	"crates/bitrock": "0.0.0"
+}
