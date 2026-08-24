@@ -80,6 +80,14 @@ pub enum Error {
         /// Underlying decompression failure.
         source: std::io::Error,
     },
+    /// A codec produced more bytes than the caller's ceiling permitted.
+    #[snafu(display("decompression bomb: {codec} would produce more than {limit} bytes"))]
+    DecompressBomb {
+        /// Name of the codec whose output ran past the ceiling.
+        codec: &'static str,
+        /// Ceiling in bytes the decoder was allowed to write.
+        limit: usize,
+    },
     /// A file block names a negative page, offset, or size.
     #[snafu(display("block references page {page} offset {offset} size {size}"))]
     BadBlock {

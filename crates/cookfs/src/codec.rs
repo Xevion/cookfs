@@ -8,8 +8,27 @@ use std::io::Read;
 use snafu::{OptionExt, ResultExt};
 
 use crate::read::{
-    CodecUnavailableSnafu, DecompressSnafu, EmptyBlobSnafu, Result, UnknownCodecSnafu,
+    CodecUnavailableSnafu, DecompressBombSnafu, DecompressSnafu, EmptyBlobSnafu, Result,
+    UnknownCodecSnafu,
 };
+
+/// Reads a decoder to end, but errors instead of silently truncating past `limit`.
+///
+/// `.take(limit)` alone would stop reading at the ceiling and return the
+/// truncated output as if it had decompressed cleanly, which lets a
+/// decompression bomb sneak past as a legitimate result. Taking `limit + 1`
+/// and refusing anything over `limit` turns the cap into a hard error.
+fn read_bounded<R: Read>(reader: R, limit: usize, codec: &'static str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .context(DecompressSnafu { codec })?;
+    if out.len() > limit {
+        return DecompressBombSnafu { codec, limit }.fail();
+    }
+    Ok(out)
+}
 
 /// A compression codec named by a blob's leading id byte.
 ///
@@ -143,59 +162,47 @@ fn unavailable(codec: Codec, feature: &'static str) -> Result<Vec<u8>> {
 /// untrusted input cannot exhaust memory even when the codec reports its own
 /// end-of-stream cleanly.
 fn decode_deflate(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    flate2::read::DeflateDecoder::new(body)
-        .take(uncompressed_len as u64)
-        .read_to_end(&mut out)
-        .context(DecompressSnafu { codec: "deflate" })?;
-    Ok(out)
+    read_bounded(
+        flate2::read::DeflateDecoder::new(body),
+        uncompressed_len,
+        "deflate",
+    )
 }
 
 #[cfg(feature = "codec-bzip2")]
 fn decode_bzip2(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    bzip2::read::BzDecoder::new(body)
-        .take(uncompressed_len as u64)
-        .read_to_end(&mut out)
-        .context(DecompressSnafu { codec: "bzip2" })?;
-    Ok(out)
+    read_bounded(bzip2::read::BzDecoder::new(body), uncompressed_len, "bzip2")
 }
 
 #[cfg(feature = "codec-zstd")]
 fn decode_zstd(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    zstd::stream::read::Decoder::new(body)
-        .context(DecompressSnafu { codec: "zstd" })?
-        .take(uncompressed_len as u64)
-        .read_to_end(&mut out)
-        .context(DecompressSnafu { codec: "zstd" })?;
-    Ok(out)
+    let decoder =
+        zstd::stream::read::Decoder::new(body).context(DecompressSnafu { codec: "zstd" })?;
+    read_bounded(decoder, uncompressed_len, "zstd")
 }
 
 #[cfg(feature = "codec-brotli")]
 fn decode_brotli(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
     const BUFFER_SIZE: usize = 4096;
-    let mut out = Vec::new();
-    brotli::Decompressor::new(body, BUFFER_SIZE)
-        .take(uncompressed_len as u64)
-        .read_to_end(&mut out)
-        .context(DecompressSnafu { codec: "brotli" })?;
-    Ok(out)
+    read_bounded(
+        brotli::Decompressor::new(body, BUFFER_SIZE),
+        uncompressed_len,
+        "brotli",
+    )
 }
 
 /// BitRock's legacy custom slot (id 255): the classic `.lzma`-alone
 /// container, a 13-byte header (properties, dictionary size, uncompressed
 /// size) that `liblzma`'s alone decoder consumes itself.
 fn decode_lzma_alone(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
     let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
         .map_err(std::io::Error::other)
         .context(DecompressSnafu { codec: "lzma" })?;
-    liblzma::read::XzDecoder::new_stream(body, stream)
-        .take(uncompressed_len as u64)
-        .read_to_end(&mut out)
-        .context(DecompressSnafu { codec: "lzma" })?;
-    Ok(out)
+    read_bounded(
+        liblzma::read::XzDecoder::new_stream(body, stream),
+        uncompressed_len,
+        "lzma",
+    )
 }
 
 /// `CFS0003`'s id-3 LZMA blobs (pages, pgindex, fsindex) are raw LZMA1
@@ -204,9 +211,12 @@ fn decode_lzma_alone(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
 /// uncompressed-size field and no end-of-stream marker.
 ///
 /// With no end marker, `liblzma`'s decoder never reports [`Status::StreamEnd`]
-/// and its `Read` wrapper errors the moment input runs out, so the read is
-/// bounded to `uncompressed_len`, the blob's own declared size, instead of
-/// running to a completion signal that never comes.
+/// and its `Read` wrapper errors the moment input runs out. The take-count
+/// is the reader's *only* termination signal, not a bomb guard: it must be
+/// exactly `uncompressed_len`, so [`read_bounded`]'s `limit + 1` trick would
+/// invoke the decoder past its natural stop and fail on missing input.
+/// A crafted, lying `uncompressed_len` is still bounded by 4 GiB in `u32`;
+/// downstream parsing catches a truncated blob.
 ///
 /// [`Status::StreamEnd`]: liblzma::stream::Status::StreamEnd
 fn decode_raw_lzma1(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
@@ -219,10 +229,10 @@ fn decode_raw_lzma1(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
         .map_err(std::io::Error::other)
         .context(DecompressSnafu { codec: "lzma" })?;
 
-    let mut out = Vec::new();
     let stream = liblzma::stream::Stream::new_raw_decoder(&filters)
         .map_err(std::io::Error::other)
         .context(DecompressSnafu { codec: "lzma" })?;
+    let mut out = Vec::new();
     liblzma::read::XzDecoder::new_stream(payload, stream)
         .take(uncompressed_len as u64)
         .read_to_end(&mut out)

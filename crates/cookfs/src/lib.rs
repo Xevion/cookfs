@@ -33,6 +33,45 @@ pub use read::Result;
 /// Worker count assumed when the OS cannot report available parallelism.
 const WORKERS_FALLBACK: usize = 4;
 
+/// Default ceiling on a decompressed fsindex, in bytes. High enough for any
+/// real archive, low enough that a crafted highly-compressible blob cannot
+/// force a multi-GB allocation before the reader errors.
+const DEFAULT_MAX_FSINDEX_LEN: u32 = 256 * 1024 * 1024;
+
+/// Knobs for [`Archive::open_with`].
+///
+/// New fields may appear in later versions; construct via [`OpenOptions::new`]
+/// or [`OpenOptions::default`] and assign the fields you want to override.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct OpenOptions {
+    /// Ceiling on the decompressed fsindex blob, in bytes.
+    ///
+    /// `CFS0002` does not declare an fsindex uncompressed size on the wire,
+    /// so without a ceiling a highly-compressible blob could inflate to the
+    /// 4 GiB `u32::MAX` bound before the reader errors. This cap acts as a
+    /// defense-in-depth ceiling for both formats, even where a declared size
+    /// exists. Defaults to 256 MiB; raise for archives with unusually large
+    /// directory trees, lower to harden against untrusted input.
+    pub max_fsindex_len: u32,
+}
+
+impl OpenOptions {
+    /// A fresh options value at its defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            max_fsindex_len: DEFAULT_MAX_FSINDEX_LEN,
+        }
+    }
+}
+
 /// Which cookfs trailer format an archive was opened as.
 ///
 /// Both formats share one directory-tree encoding; this only names the
@@ -62,8 +101,7 @@ pub struct Archive<R> {
 }
 
 impl<R: ReadAt + Size> Archive<R> {
-    /// Opens a `CFS0002` or `CFS0003` archive, parsing its trailer and
-    /// directory tree.
+    /// Opens a `CFS0002` or `CFS0003` archive with the default [`OpenOptions`].
     ///
     /// # Errors
     ///
@@ -71,6 +109,16 @@ impl<R: ReadAt + Size> Archive<R> {
     /// [`Error::NoSignature`] if no known trailer parses anywhere in it, or
     /// any error a format-specific parser or the fsindex parser can produce.
     pub fn open(src: R) -> Result<Self> {
+        Self::open_with(src, OpenOptions::default())
+    }
+
+    /// Opens an archive with caller-supplied [`OpenOptions`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Archive::open`]; additionally, [`Error::Decompress`] if the
+    /// fsindex would decompress to more than `opts.max_fsindex_len` bytes.
+    pub fn open_with(src: R, opts: OpenOptions) -> Result<Self> {
         let len = src.size().ok().flatten().context(NoLengthSnafu)?;
 
         let (sig_at, which) = read::find_signature(
@@ -99,9 +147,12 @@ impl<R: ReadAt + Size> Archive<R> {
         };
 
         let raw = read::at(&src, layout.fsindex_at, layout.fsindex_len)?;
-        // CFS0002 declares no fsindex uncompressed size; only a raw LZMA1
-        // blob needs one to bound its read, and CFS0002 never emits one here.
-        let fsindex_uncompressed_len = layout.fsindex_uncompressed_len.unwrap_or(u32::MAX);
+        // CFS0002 declares no fsindex uncompressed size; CFS0003 declares one
+        // that could still lie. The cap is the ceiling in both cases.
+        let fsindex_uncompressed_len = layout
+            .fsindex_uncompressed_len
+            .unwrap_or(u32::MAX)
+            .min(opts.max_fsindex_len);
         let index = Index::parse(&decode_page(
             &raw,
             layout.fsindex_codec,
@@ -441,6 +492,67 @@ mod tests {
         });
 
         check!(let Err(Error::PageOutOfRange { .. }) = archive.read(bad));
+    }
+
+    /// Builds a CFS0002 archive whose fsindex uses a deflate-compressed blob.
+    ///
+    /// The archive holds no pages and an empty root directory; its fsindex
+    /// plaintext is `FSINDEX_MAGIC + 0_children + 0_metadata` = 16 bytes.
+    fn cfs0002_with_deflate_fsindex() -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        let mut fsindex_plain = read::FSINDEX_MAGIC.to_vec();
+        fsindex_plain.extend_from_slice(&0u32.to_be_bytes()); // no children
+        fsindex_plain.extend_from_slice(&0u32.to_be_bytes()); // no metadata
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&fsindex_plain).unwrap();
+        let deflated = enc.finish().unwrap();
+
+        let mut fsindex = vec![1u8]; // codec id 1: deflate
+        fsindex.extend_from_slice(&deflated);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&fsindex);
+        buf.extend_from_slice(&(fsindex.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // page_count
+        buf.push(0); // archive-wide codec, informational
+        buf.extend_from_slice(parsers::cfs0002::SIGNATURE);
+        buf
+    }
+
+    #[test]
+    fn open_options_default_caps_fsindex_at_256_mib() {
+        check!(OpenOptions::default().max_fsindex_len == 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn open_with_a_generous_cap_reads_a_deflated_fsindex() {
+        let buf = cfs0002_with_deflate_fsindex();
+        let opts = OpenOptions {
+            max_fsindex_len: 1024,
+            ..OpenOptions::default()
+        };
+        let archive = Archive::open_with(buf, opts).unwrap();
+        check!(archive.walk().is_empty());
+    }
+
+    /// A cap smaller than the fsindex plaintext must error instead of silently
+    /// truncating; the decoder's own bounded read would otherwise let a bomb
+    /// past as an apparently-clean decompression.
+    #[test]
+    fn open_with_a_tiny_cap_errors_on_the_fsindex_decode() {
+        let buf = cfs0002_with_deflate_fsindex();
+        let opts = OpenOptions {
+            max_fsindex_len: 4,
+            ..OpenOptions::default()
+        };
+        check!(
+            let Err(Error::DecompressBomb { codec: "deflate", limit: 4 })
+                = Archive::open_with(buf, opts)
+        );
     }
 
     /// A crafted block whose offset runs past the page would slice-index the
