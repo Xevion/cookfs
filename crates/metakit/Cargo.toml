@@ -1,0 +1,16 @@
+[package]
+name = "metakit"
+description = "Metakit, the embedded database and virtual filesystem behind Tcl starkits and InstallBuilder installers"
+keywords = ["metakit", "mk4", "tcl", "vfs", "starkit"]
+categories = ["filesystem", "parser-implementations"]
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

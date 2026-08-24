@@ -1,0 +1,15 @@
+[package]
+name = "cookfs"
+description = "cookfs, the page-based Tcl virtual filesystem archive embedded in tclkit binaries and InstallBuilder installers"
+keywords = ["cookfs", "tcl", "vfs", "archive", "installbuilder"]
+categories = ["filesystem", "compression"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
