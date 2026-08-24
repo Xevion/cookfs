@@ -1,7 +1,7 @@
-//! Resolves and validates the sample corpus.
+//! Checks `corpus.toml`, and the samples it names when they have been fetched.
 //!
-//! An absent corpus skips and passes; a corpus that is present but broken fails loudly. The two
-//! must never collapse into each other, or a run that checked nothing reports green.
+//! An absent corpus skips; one that is present but wrong fails. Collapsing those two would let a
+//! run that checked nothing report green.
 
 use std::env;
 use std::fs;
@@ -9,8 +9,17 @@ use std::path::{Path, PathBuf};
 
 use assert2::check;
 
-/// Names the manifest CI syncs into a temp dir; unset locally, where `samples/` is used instead.
-const MANIFEST_ENV: &str = "COOKFS_CORPUS_MANIFEST";
+/// Overrides where samples live; the corpus tool reads the same variable.
+const DIR_ENV: &str = "COOKFS_CORPUS_DIR";
+
+#[derive(Debug)]
+struct Sample {
+    name: String,
+    sha256: String,
+    size: u64,
+    format: String,
+    container: String,
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -20,74 +29,108 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `None` when no corpus is configured at all. A configured-but-missing manifest is a broken
-/// setup, not an absent corpus, so it panics rather than degrading to a skip.
-fn manifest_path() -> Option<PathBuf> {
-    if let Ok(raw) = env::var(MANIFEST_ENV) {
-        let path = PathBuf::from(&raw);
-        assert!(
-            path.is_file(),
-            "{MANIFEST_ENV} is set to {raw}, which names no file"
-        );
-        return Some(path);
-    }
-    let local = workspace_root().join("samples").join("manifest.toml");
-    local.is_file().then_some(local)
+fn samples_dir() -> PathBuf {
+    env::var(DIR_ENV).map_or_else(|_| workspace_root().join("samples"), PathBuf::from)
 }
 
-/// Fixture paths, relative to the manifest's own directory.
-fn fixtures(manifest: &Path) -> Vec<PathBuf> {
-    let text = fs::read_to_string(manifest)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", manifest.display()));
+fn manifest() -> Vec<Sample> {
+    let path = workspace_root().join("corpus.toml");
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let table: toml::Table = text
         .parse()
-        .unwrap_or_else(|e| panic!("{} is not valid TOML: {e}", manifest.display()));
+        .unwrap_or_else(|e| panic!("{} is not valid TOML: {e}", path.display()));
 
     let entries = table
-        .get("fixture")
+        .get("sample")
         .and_then(toml::Value::as_array)
-        .unwrap_or_else(|| panic!("{} declares no [[fixture]] entries", manifest.display()));
+        .unwrap_or_else(|| panic!("{} declares no [[sample]] entries", path.display()));
+
+    let field = |entry: &toml::Value, key: &str| -> String {
+        entry
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("a [[sample]] in {} has no `{key}`", path.display()))
+            .to_owned()
+    };
 
     entries
         .iter()
-        .map(|entry| {
-            let path = entry
-                .get("path")
-                .and_then(toml::Value::as_str)
-                .unwrap_or_else(|| panic!("a [[fixture]] in {} has no `path`", manifest.display()));
-            PathBuf::from(path)
+        .map(|entry| Sample {
+            name: field(entry, "name"),
+            sha256: field(entry, "sha256"),
+            format: field(entry, "format"),
+            container: field(entry, "container"),
+            size: entry
+                .get("size")
+                .and_then(toml::Value::as_integer)
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or_else(|| {
+                    panic!("a [[sample]] in {} has no usable `size`", path.display())
+                }),
         })
         .collect()
 }
 
-/// Digests are verified once when the corpus is fetched, so this only proves every listed
-/// fixture materialized; rehashing multi-gigabyte samples per run would not be worth it.
 #[test]
-fn every_listed_fixture_resolves() {
-    let Some(manifest) = manifest_path() else {
-        eprintln!("skipping: no corpus (set {MANIFEST_ENV}, or populate samples/manifest.toml)");
+fn the_manifest_is_well_formed() {
+    let samples = manifest();
+    assert!(!samples.is_empty(), "corpus.toml lists zero samples");
+
+    let mut names: Vec<&str> = samples.iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    let unique = names.len();
+    names.dedup();
+    check!(names.len() == unique, "corpus.toml repeats a sample name");
+
+    for sample in &samples {
+        check!(sample.size > 0, "{} has size 0", sample.name);
+        check!(
+            sample.sha256.len() == 64 && sample.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+            "{} has a malformed sha256",
+            sample.name
+        );
+        check!(
+            matches!(sample.format.as_str(), "CFS0002" | "CFS0003" | "none"),
+            "{} has an unknown format {:?}",
+            sample.name,
+            sample.format
+        );
+        check!(
+            matches!(sample.container.as_str(), "raw" | "zip"),
+            "{} has an unknown container {:?}",
+            sample.name,
+            sample.container
+        );
+    }
+}
+
+/// Sizes, not digests: the fetch hashes every byte on the way in.
+#[test]
+fn every_sample_resolves() {
+    let dir = samples_dir();
+    if !dir.is_dir() {
+        eprintln!(
+            "skipping: no corpus at {} (run `tempo corpus -- pull`)",
+            dir.display()
+        );
         return;
-    };
-    let root = manifest
-        .parent()
-        .expect("a manifest file path has a parent directory");
+    }
 
-    let fixtures = fixtures(&manifest);
-    assert!(
-        !fixtures.is_empty(),
-        "{} lists zero fixtures",
-        manifest.display()
-    );
-
-    for relative in fixtures {
-        let path = root.join(&relative);
+    for sample in manifest() {
+        let path = dir.join(&sample.name);
         let metadata = fs::metadata(&path).unwrap_or_else(|e| {
             panic!(
-                "{} lists {}, which does not resolve: {e}",
-                manifest.display(),
-                relative.display()
+                "corpus.toml lists {}, which does not resolve: {e}",
+                sample.name
             )
         });
-        check!(metadata.len() > 0, "{} is empty", relative.display());
+        check!(
+            metadata.len() == sample.size,
+            "{} is {} bytes, manifest says {}",
+            sample.name,
+            metadata.len(),
+            sample.size
+        );
     }
 }

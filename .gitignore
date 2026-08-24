@@ -2,4 +2,3 @@
 /coverage
 Cargo.lock
 .env
-node_modules

@@ -33,7 +33,7 @@ jobs:
       - name: Audit workflows
         env:
           GH_TOKEN: ${{ github.token }}
-        run: just zizmor
+        run: zizmor .
 
   advisories:
     name: advisories
