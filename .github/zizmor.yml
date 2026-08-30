@@ -1,0 +1,8 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Actions under this account sit inside the same trust boundary as this
+        # repo, so a tag pin exposes no third party who could retag them.
+        "Xevion/*": ref-pin
+        "*": hash-pin

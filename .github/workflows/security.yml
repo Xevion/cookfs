@@ -50,4 +50,4 @@ jobs:
         with:
           cache: "false"
       - name: Scan for advisories
-        uses: Xevion/advisory-action@cba69b6d84bec3957c1a6b73b0d229f2f59a161f # v1
+        uses: Xevion/advisory-action@v1
