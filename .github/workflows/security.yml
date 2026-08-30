@@ -44,16 +44,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0 # the baseline is scanned from a worktree
       - name: Install toolchain
         uses: ./.github/actions/setup
         with:
           cache: "false"
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
-        with:
-          tool: cargo-audit
-      # Cargo.lock is not committed, so the scan resolves its own.
-      - name: Resolve dependencies
-        run: cargo generate-lockfile
       - name: Scan for advisories
-        run: cargo audit
+        uses: Xevion/advisory-action@cba69b6d84bec3957c1a6b73b0d229f2f59a161f # v1
