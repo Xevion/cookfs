@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/Xevion/cookfs"
 
 [workspace.dependencies]
-assert2 = "0.4.0"
+assert2 = "0.4.1"
 proptest = "1.11.0"
 rstest = "0.26.1"
 toml = "1.1.4"
