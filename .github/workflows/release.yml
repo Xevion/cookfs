@@ -1,12 +1,18 @@
-# Publishes to crates.io when release-please cuts a GitHub Release. release-please tags as
-# `{crate}-v{version}`; which crate that names decides what gets built, but whether it actually
-# ships is read from that crate's own `publish` field via `cargo metadata`.
+# Publishes a crate to crates.io when its `{crate}-vX.Y.Z` tag is pushed, then cuts its GitHub
+# Release. Which crate the tag names decides what gets built; whether it actually ships is read
+# from that crate's own `publish` field via `cargo metadata`, so unpublished crates never release.
 
 name: release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["*-v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish again ({crate}-vX.Y.Z)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,12 +23,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: read
+      contents: write # Create the GitHub Release.
       id-token: write # Mint the OIDC token trusted publishing exchanges for a registry token.
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.TAG }}
           persist-credentials: false
       # Uncached: this build gets published, and any PR can write the cache it would restore.
       - name: Install toolchain
@@ -31,13 +40,24 @@ jobs:
           cache: false
       - name: Resolve crate from release tag
         id: crate
-        env:
-          TAG: ${{ github.event.release.tag_name }}
         run: |
           name="${TAG%-v[0-9]*}"
-          publish=$(cargo metadata --no-deps --format-version 1 | jq -r --arg name "$name" '.packages[] | select(.name == $name) | .publish')
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "publishable=$([ "$publish" = '[]' ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+          version="${TAG#"$name"-v}"
+          package=$(cargo metadata --no-deps --format-version 1 | jq -c --arg name "$name" '.packages[] | select(.name == $name)')
+          if [ -z "$package" ]; then
+            echo "::error::no crate named $name in this workspace"
+            exit 1
+          fi
+          actual=$(jq -r .version <<< "$package")
+          if [ "$actual" != "$version" ]; then
+            echo "::error::$name is $actual in the manifest but the tag says $version"
+            exit 1
+          fi
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "publishable=$([ "$(jq -c .publish <<< "$package")" = '[]' ] && echo false || echo true)"
+          } >> "$GITHUB_OUTPUT"
       - name: Skip unpublishable crate
         if: steps.crate.outputs.publishable == 'false'
         env:
@@ -55,3 +75,14 @@ jobs:
           CRATE_NAME: ${{ steps.crate.outputs.name }}
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked -p "$CRATE_NAME"
+      # The Release takes its notes from that version's section of the crate's CHANGELOG.md.
+      - name: Create GitHub Release
+        if: steps.crate.outputs.publishable == 'true'
+        env:
+          CRATE_NAME: ${{ steps.crate.outputs.name }}
+          VERSION: ${{ steps.crate.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(awk -v v="$VERSION" '/^## /{ if (found) exit; found = index($0, "[" v "]") || index($0, "## " v " "); next } found' "crates/$CRATE_NAME/CHANGELOG.md")
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$CRATE_NAME: v$VERSION" --notes "$notes"
