@@ -73,9 +73,23 @@ pub(crate) struct Expect {
 }
 
 /// Decodes a `CFS0002` blob, whose first byte names its codec.
+///
+/// Legacy bzip2 blobs also carry the decoded size, as a big-endian `u32`
+/// between the id byte and the stream.
 pub(crate) fn decode_prefixed(blob: &[u8], expect: Expect) -> Result<Vec<u8>, CodecError> {
     let (&id, body) = blob.split_first().ok_or(CodecError::Empty)?;
-    decode(Compression::from_raw(id), body, expect)
+    let id = Compression::from_raw(id);
+    if id == Compression::BZIP2 {
+        let (size, stream) = body.split_first_chunk::<4>().ok_or(CodecError::Empty)?;
+        let expect = Expect {
+            declared: expect
+                .declared
+                .or_else(|| Some(u32::from_be_bytes(*size) as usize)),
+            ..expect
+        };
+        return decode(id, stream, expect);
+    }
+    decode(id, body, expect)
 }
 
 /// Decodes a payload whose codec is named out of band.
@@ -360,6 +374,19 @@ mod tests {
         let mut blob = vec![1u8];
         blob.extend_from_slice(&deflate(TEXT));
         check!(decode_prefixed(&blob, exact(TEXT.len())).unwrap() == TEXT);
+    }
+
+    #[cfg(feature = "codec-bzip2")]
+    #[test]
+    fn a_legacy_bzip2_blob_carries_its_size_before_the_stream() {
+        let mut blob = vec![2u8];
+        blob.extend_from_slice(&(TEXT.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&bzip2_stream(TEXT));
+        let expect = Expect {
+            declared: None,
+            limit: 1 << 20,
+        };
+        check!(decode_prefixed(&blob, expect).unwrap() == TEXT);
     }
 
     /// The decoder's internal buffer boundary falls inside a large payload,

@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- A `CFS0002` bzip2 blob decodes; legacy writes its size ahead of the stream.
 - An empty file in a `CFS0003` archive, which upstream stores as a zero-size block on page -1,
   reads as empty instead of failing.
 - A negative block field, or a block naming a page the archive lacks, is refused at open
