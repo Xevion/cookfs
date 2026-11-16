@@ -58,6 +58,12 @@ pub enum CodecError {
         /// The size actually produced.
         got: usize,
     },
+    /// An encrypted blob did not decrypt.
+    #[snafu(display("blob did not decrypt: {why}"))]
+    Decrypt {
+        /// What was wrong with it.
+        why: &'static str,
+    },
     /// The decoded bytes do not hash to what the archive stored for them.
     #[snafu(display("decoded bytes fail their {hash} check"))]
     HashMismatch {

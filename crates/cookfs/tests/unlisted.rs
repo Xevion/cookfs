@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use assert2::{assert, check};
-use cookfs::{Archive, EncryptionMode, Error, OpenOptions};
+use assert2::check;
+use cookfs::{Archive, OpenOptions};
 
 fn open(name: &str) -> cookfs::Result<Archive<Vec<u8>>> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35,16 +35,4 @@ fn a_name_holding_a_newline_reads_back_whole(#[case] name: &str) {
                 ("plain".to_owned(), b"contents of entry 1\n".to_vec()),
             ]
     );
-}
-
-#[test]
-fn file_mode_encryption_is_refused_as_encrypted() {
-    check!(let Err(Error::Encrypted { mode: EncryptionMode::FILE }) = open("v3-encrypt-file.cfs"));
-}
-
-/// The pgindex is itself encrypted in this mode, so it cannot be decoded before the mode is checked.
-#[test]
-fn key_index_encryption_is_refused_as_encrypted() {
-    let err = open("v3-encrypt-key-index.cfs").err();
-    assert!(let Some(Error::Encrypted { mode: EncryptionMode::KEY_INDEX }) = err);
 }

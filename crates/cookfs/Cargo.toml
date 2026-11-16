@@ -14,10 +14,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+aes.workspace = true
 arbitrary-int.workspace = true
 bitbybit.workspace = true
 brotli = { workspace = true, optional = true }
 bzip2 = { workspace = true, optional = true }
+cbc.workspace = true
 crc32fast.workspace = true
 flate2.workspace = true
 la-arena.workspace = true
@@ -25,7 +27,9 @@ liblzma.workspace = true
 lru.workspace = true
 md-5.workspace = true
 parking_lot.workspace = true
+pbkdf2.workspace = true
 positioned-io.workspace = true
+sha2.workspace = true
 snafu.workspace = true
 zerocopy.workspace = true
 zstd = { workspace = true, optional = true }

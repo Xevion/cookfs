@@ -60,14 +60,20 @@ pub enum Error {
         /// The decoder's failure.
         source: CodecError,
     },
-    /// The archive is encrypted, which this reader does not yet decrypt.
-    #[snafu(display("archive is encrypted ({mode})"))]
+    /// The archive is encrypted and no password was given, or its encryption data is missing.
+    #[snafu(display("archive is encrypted ({mode}) and needs a password"))]
     Encrypted {
         /// The archive's encryption mode.
         mode: EncryptionMode,
     },
-    /// A page is flagged as encrypted in an archive whose suffix says it is not.
-    #[snafu(display("page {page} is flagged as encrypted"))]
+    /// The password does not unlock the archive's stored key.
+    ///
+    /// Only `KEY` and `KEY_INDEX` archives can tell at open. A wrong password
+    /// for a `FILE` archive shows when a page fails to decrypt or verify.
+    #[snafu(display("the password does not unlock this archive"))]
+    WrongPassword,
+    /// A page is flagged as encrypted in an archive that holds no key for it.
+    #[snafu(display("page {page} is flagged as encrypted, but the archive has no key"))]
     EncryptedPage {
         /// The page.
         page: u32,

@@ -271,13 +271,17 @@ proc decoy {path archive flavor} {
 }
 
 # Current: write through upstream's own mounted filesystem.
-proc current {path options {files {}}} {
+# A PASSWORD set after mounting, rather than through `-password`, is how `-encryptkey` reaches KEY mode.
+proc current {path options {files {}} {password {}}} {
     if {$files eq {}} {
         set files [tree]
     }
     file delete $path
     set mount /fixture
-    cookfs::Mount {*}$options $path $mount
+    set fs [cookfs::Mount {*}$options $path $mount]
+    if {$password ne {}} {
+        $fs password $password
+    }
     set dirs {}
     foreach {name mtime data} $files {
         set dir [file dirname "$mount/$name"]
@@ -494,13 +498,18 @@ switch -- $flavor {
         file mkdir $unlisted
         current [file join $unlisted v3-newline-name.cfs] [concat $shape {-compression zlib}] \
             [list "line\nbreak" 1700000000 "contents of entry 0\n" plain 1700000001 "contents of entry 1\n"]
-        # Upstream draws a fresh salt per write, so these never rebuild byte for byte.
-        # `-encryptkey` without a password writes an unencrypted archive, so it is not here.
-        foreach {name extra} {
-            v3-encrypt-file {-password secret}
-            v3-encrypt-key-index {-password secret -encryptkey}
+        # Upstream draws a fresh salt per write, so these never rebuild byte for byte. Each
+        # one's password is `secret`, which the sample test passes for any `-encrypt-` name.
+        foreach {name extra later} {
+            v3-encrypt-file {-password secret} {}
+            v3-encrypt-key {-encryptkey} secret
+            v3-encrypt-key-index {-password secret -encryptkey} {}
+            v3-encrypt-level16 {-password secret -encryptlevel 16} {}
         } {
-            current [file join $unlisted $name.cfs] [concat $shape {-compression zlib -encryptlevel 0} $extra]
+            # Level 0 keeps key derivation cheap; one fixture past 15 covers the costlier rounds.
+            current [file join $outdir $name.cfs] \
+                [concat $shape {-compression zlib -encryptlevel 0} $extra] {} $later
+            puts $name
         }
     }
     default {

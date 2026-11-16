@@ -199,7 +199,9 @@ async function fixtures(): Promise<void> {
     const lib = await library(flavor);
     const names = (await output(["tclsh", WRITE, flavor, lib, FIXTURES], ROOT)).trim().split("\n");
     for (const name of names) {
-      const listing = await output(["tclsh", DUMP, flavor, lib, join(FIXTURES, `${name}.cfs`)], ROOT);
+      // Every encrypted fixture is written with the password `secret`.
+      const password = name.includes("-encrypt-") ? ["secret"] : [];
+      const listing = await output(["tclsh", DUMP, flavor, lib, join(FIXTURES, `${name}.cfs`), ...password], ROOT);
       await Bun.write(join(FIXTURES, `${name}.tsv`), listing);
       console.log(`${name}: ${listing.split("\n").length - 1} entries`);
     }

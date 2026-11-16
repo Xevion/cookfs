@@ -16,6 +16,8 @@
 - The `cache` module, `PageCache`, `Budget` and `Page` are no longer public.
 - The public error enums, `Kind`, `ArchiveVersion`, `Blob`, `Node` and `Block` are
   `#[non_exhaustive]`.
+- `OpenOptions` is `Clone` but no longer `Copy`, since it can hold a password.
+- `Error::Encrypted` now means no password was given.
 - `Limits` gains `max_file_len` (1 GiB by default), past which `Archive::read` refuses a file.
 - A directory's children are sorted by name.
 
@@ -24,6 +26,9 @@
 - Every page, pgindex and fsindex is checked against the MD5 or CRC-32 the archive stores for
   it, failing with `CodecError::HashMismatch`. On by default; `OpenOptions::verify` turns it
   off. Blobs written without a hash are not checked.
+- Encrypted `CFS0003` archives read with `OpenOptions::with_password`, in all three of
+  upstream's modes. A `KEY` or `KEY_INDEX` archive opened with the wrong password fails with
+  `Error::WrongPassword`; a `FILE` one fails as its pages fail to decrypt.
 - `Archive::metadata` and `Archive::metadata_entries` read the fsindex's archive-wide records.
 - Fileset archives list their active fileset as the root, as upstream mounts them.
   `Archive::filesets`, `Archive::fileset` and `Archive::select_fileset` list and switch them.
@@ -39,7 +44,6 @@
   instead of at read.
 - A block running past its page is an error instead of a silently short read.
 - A decoded page or index that disagrees with its declared size is an error.
-- An encrypted `CFS0003` archive is refused instead of read as garbage.
 - A deeply nested fsindex can no longer overflow the stack.
 - A crafted LZMA dictionary size or file size can no longer force a multi-GiB allocation.
 - A source packed with signatures is refused quickly; each hit was a full trailer parse.

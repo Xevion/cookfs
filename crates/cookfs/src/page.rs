@@ -7,6 +7,7 @@
 use md5::{Digest, Md5};
 
 use crate::codec::{self, CodecError, Expect, codec_error};
+use crate::crypto::Key;
 use crate::wire::Compression;
 
 /// What a blob's stored 16-byte hash says its decoded bytes are.
@@ -70,19 +71,32 @@ pub(crate) struct BlobRef {
     pub(crate) encrypted: bool,
     /// What the decoded bytes hash to.
     pub(crate) hash: Hash,
+    /// The stored hash slot as written, which an encrypted blob is decrypted under as its IV.
+    pub(crate) iv: [u8; 16],
 }
 
 impl BlobRef {
-    /// Decodes the blob, then checks its hash unless `verify` is off.
+    /// Decrypts the blob if it is encrypted, decodes it, then checks its hash unless `verify` is off.
+    ///
+    /// An encrypted blob needs `key`; callers refuse one without it first.
     pub(crate) fn decode(
         &self,
         raw: &[u8],
         limit: usize,
         verify: bool,
+        key: Option<&Key>,
     ) -> Result<Vec<u8>, CodecError> {
         let expect = Expect {
             declared: self.declared.map(|n| n as usize),
             limit,
+        };
+        let plain;
+        let raw = match key {
+            Some(key) if self.encrypted => {
+                plain = key.decrypt(&self.iv, raw)?;
+                plain.as_slice()
+            }
+            _ => raw,
         };
         let out = match self.codec {
             Codec::Prefixed => codec::decode_prefixed(raw, expect),

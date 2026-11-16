@@ -8,6 +8,7 @@
 mod bytes;
 mod cache;
 mod codec;
+mod crypto;
 mod error;
 mod index;
 mod limits;
@@ -21,6 +22,7 @@ use positioned_io::{ReadAt, Size};
 use snafu::{OptionExt, ResultExt, ensure};
 
 use cache::{Budget, Page, PageCache};
+use crypto::Key;
 use error::error as ctx;
 use index::Index;
 use page::BlobRef;
@@ -70,7 +72,7 @@ pub mod fuzzing {
 const WORKERS_FALLBACK: usize = 4;
 
 /// What [`Archive::open`] needs to know beyond the source.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct OpenOptions {
     /// Ceilings on what the archive's own bytes can make the reader allocate.
@@ -80,6 +82,19 @@ pub struct OpenOptions {
     /// On by default. Upstream writes an MD5 or CRC-32 of each decoded blob;
     /// one written without a hash is never checked either way.
     pub verify: bool,
+    password: Option<Vec<u8>>,
+}
+
+impl OpenOptions {
+    /// Opens an encrypted `CFS0003` archive with `password`.
+    ///
+    /// Upstream derives the key from the password's bytes as Tcl holds them,
+    /// which for a password beyond Latin-1 is not its UTF-8 encoding.
+    #[must_use]
+    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
 }
 
 impl Default for OpenOptions {
@@ -87,7 +102,18 @@ impl Default for OpenOptions {
         Self {
             limits: Limits::default(),
             verify: true,
+            password: None,
         }
+    }
+}
+
+impl std::fmt::Debug for OpenOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenOptions")
+            .field("limits", &self.limits)
+            .field("verify", &self.verify)
+            .field("password", &self.password.as_ref().map(|_| ".."))
+            .finish()
     }
 }
 
@@ -115,6 +141,7 @@ pub struct Archive<R> {
     limits: Limits,
     verify: bool,
     encryption: Option<Encryption>,
+    key: Option<Key>,
     /// The fileset directory standing in for the root, when the archive has filesets.
     fileset: Option<Idx<Node>>,
 }
@@ -166,7 +193,12 @@ impl<R: ReadAt + Size> Archive<R> {
                 }
             },
         )?;
-        let (layout, version, index) = match (opened, first_error) {
+        let Assembled {
+            layout,
+            version,
+            index,
+            key,
+        } = match (opened, first_error) {
             (Some(found), _) => found,
             (None, Some(e)) => return Err(e),
             (None, None) => return parsers::trailer_error::NoSignature.fail()?,
@@ -190,6 +222,7 @@ impl<R: ReadAt + Size> Archive<R> {
             limits,
             verify: opts.verify,
             encryption: layout.encryption,
+            key,
             fileset,
         })
     }
@@ -211,13 +244,21 @@ impl<R: ReadAt + Size> Archive<R> {
             page: n,
             pages: self.pages.len(),
         })?;
-        ensure!(!blob.encrypted, ctx::EncryptedPage { page: n });
+        ensure!(
+            !blob.encrypted || self.key.is_some(),
+            ctx::EncryptedPage { page: n }
+        );
         self.cache.get_or_load(n as usize, || {
             let raw = source::at(&self.src, blob.at, blob.len as usize)?;
-            blob.decode(&raw, self.limits.max_page_len, self.verify)
-                .context(ctx::Decode {
-                    blob: Blob::Page(n),
-                })
+            blob.decode(
+                &raw,
+                self.limits.max_page_len,
+                self.verify,
+                self.key.as_ref(),
+            )
+            .context(ctx::Decode {
+                blob: Blob::Page(n),
+            })
         })
     }
 
@@ -378,31 +419,80 @@ fn assemble<R: ReadAt>(
     sig_at: u64,
     which: usize,
     opts: &OpenOptions,
-) -> Result<(page::Layout, ArchiveVersion, Index)> {
+) -> Result<Assembled> {
     let limits = &opts.limits;
-    let (layout, version) = if which == 0 {
-        (cfs0002::parse(src, sig_at)?, ArchiveVersion::Cfs0002)
+    let (layout, version, key) = if which == 0 {
+        (cfs0002::parse(src, sig_at)?, ArchiveVersion::Cfs0002, None)
     } else {
         let suffix = cfs0003::Suffix::read(src, sig_at)?;
         // Before the pgindex, which `KEY_INDEX` encrypts too.
-        let mode = suffix.encryption().mode;
-        ensure!(mode == EncryptionMode::NONE, ctx::Encrypted { mode });
-        (
-            cfs0003::parse(src, sig_at, &suffix, limits, opts.verify)?,
-            ArchiveVersion::Cfs0003,
-        )
+        let key = archive_key(src, sig_at, &suffix, opts)?;
+        let layout = cfs0003::parse(src, sig_at, &suffix, limits, opts.verify, key.as_ref())?;
+        (layout, ArchiveVersion::Cfs0003, key)
     };
 
     let blob = layout.fsindex;
     let raw = source::at(src, blob.at, blob.len as usize)?;
     let plain = blob
-        .decode(&raw, limits.max_fsindex_len, opts.verify)
+        .decode(&raw, limits.max_fsindex_len, opts.verify, key.as_ref())
         .context(ctx::Decode {
             blob: Blob::Fsindex,
         })?;
     let index = Index::parse(&plain, limits.max_depth)?;
     check_blocks(&index, layout.pages.len())?;
-    Ok((layout, version, index))
+    Ok(Assembled {
+        layout,
+        version,
+        index,
+        key,
+    })
+}
+
+/// Everything one trailer candidate opens to.
+struct Assembled {
+    layout: page::Layout,
+    version: ArchiveVersion,
+    index: Index,
+    key: Option<Key>,
+}
+
+/// The key an encrypted `CFS0003` archive's blobs decrypt with, from the data after its signature.
+fn archive_key<R: ReadAt>(
+    src: &R,
+    sig_at: u64,
+    suffix: &cfs0003::Suffix,
+    opts: &OpenOptions,
+) -> Result<Option<Key>> {
+    let Encryption { mode, level } = suffix.encryption();
+    if mode == EncryptionMode::NONE {
+        return Ok(None);
+    }
+    let password = opts.password.as_deref().context(ctx::Encrypted { mode })?;
+    let wrapped = mode == EncryptionMode::KEY || mode == EncryptionMode::KEY_INDEX;
+    let data_len = crypto::BLOCK
+        + if wrapped {
+            crypto::BLOCK + crypto::WRAPPED_KEY_LEN
+        } else {
+            0
+        };
+    let data = source::at(src, sig_at + cfs0003::SIGNATURE.len() as u64, data_len)
+        .context(parsers::trailer_error::Read)?;
+    let (salt, rest) = data
+        .split_first_chunk::<{ crypto::BLOCK }>()
+        .context(ctx::Encrypted { mode })?;
+    let derived = Key::derive(password, salt, level);
+    if !wrapped {
+        return Ok(Some(derived));
+    }
+    let (iv, stored) = rest
+        .split_first_chunk::<{ crypto::BLOCK }>()
+        .context(ctx::Encrypted { mode })?;
+    let stored: &[u8; crypto::WRAPPED_KEY_LEN] =
+        stored.try_into().ok().context(ctx::Encrypted { mode })?;
+    derived
+        .unwrap(iv, stored)
+        .context(ctx::WrongPassword)
+        .map(Some)
 }
 
 /// Refuses a tree that names a page the archive does not hold.

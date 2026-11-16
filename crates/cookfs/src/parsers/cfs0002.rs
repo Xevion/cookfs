@@ -119,6 +119,7 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
                 declared: slot.declared_len(),
                 encrypted: false,
                 hash: Hash::from_slot(slot.0),
+                iv: slot.0,
             };
             at += u64::from(size.get());
             page
@@ -134,6 +135,7 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
             declared: None,
             encrypted: false,
             hash: Hash::Unhashed,
+            iv: [0; 16],
         },
         encryption: None,
     })

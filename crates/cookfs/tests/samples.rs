@@ -145,8 +145,12 @@ fn unzip(path: &Path) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-fn check<R: ReadAt + Size>(src: R, listing: Option<&Path>) -> Result<(), Failed> {
-    let archive = Archive::open(src, &OpenOptions::default()).map_err(|e| format!("open: {e}"))?;
+fn check<R: ReadAt + Size>(
+    src: R,
+    listing: Option<&Path>,
+    opts: &OpenOptions,
+) -> Result<(), Failed> {
+    let archive = Archive::open(src, opts).map_err(|e| format!("open: {e}"))?;
     let ours = read_all(&archive)?;
     if ours.is_empty() && listing.is_none() {
         return Err("the tree is empty and there is no listing to say it should be".into());
@@ -197,9 +201,13 @@ fn trial(sample: Sample, dir: &Path, listings: &Path) -> Trial {
         };
 
         if sample.container == "zip" {
-            check(unzip(&path)?, listing)
+            check(unzip(&path)?, listing, &OpenOptions::default())
         } else {
-            check(File::open(&path).map_err(|e| e.to_string())?, listing)
+            check(
+                File::open(&path).map_err(|e| e.to_string())?,
+                listing,
+                &OpenOptions::default(),
+            )
         }
     })
     .with_ignored_flag(ignored)
@@ -238,11 +246,18 @@ fn fixtures() -> Vec<Trial> {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let known_bug = KNOWN_BUGS.iter().any(|&(bug, _)| bug == name);
+            // The fixture writer gives every encrypted fixture this password.
+            let opts = if name.contains("-encrypt-") {
+                OpenOptions::default().with_password("secret")
+            } else {
+                OpenOptions::default()
+            };
             Trial::test(name, move || {
                 let listing = archive.with_extension("tsv");
                 check(
                     fs::read(&archive).map_err(|e| e.to_string())?,
                     Some(&listing),
+                    &opts,
                 )
             })
             .with_kind("fixture")
