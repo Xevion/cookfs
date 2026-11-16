@@ -209,14 +209,6 @@ fn trial(sample: Sample, dir: &Path, listings: &Path) -> Trial {
 /// Fixtures this crate reads differently from upstream, ignored until fixed, each with the bug it shows.
 const KNOWN_BUGS: &[(&str, &str)] = &[
     (
-        "v2-decoy",
-        "BUG: a trailer after the archive whose fsindex fails to decode wins the scan, so open fails",
-    ),
-    (
-        "v3-decoy",
-        "BUG: a CFS0003 suffix after the archive that fits but fails to decode wins the scan, so open fails",
-    ),
-    (
         "v2-names",
         "BUG: Tcl stores NUL in a name as C0 80, which reads back as two U+FFFD instead of NUL",
     ),

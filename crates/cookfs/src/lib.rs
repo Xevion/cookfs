@@ -117,42 +117,42 @@ impl<R: ReadAt + Size> Archive<R> {
             .flatten()
             .context(source::source_error::NoLength)?;
 
-        let (sig_at, which) = source::find_signature(
+        // A candidate that passes the cheap check but fails to open may be a decoy
+        // after the real archive, so the scan goes on, a bounded number of times.
+        let mut attempts = 0;
+        let mut first_error = None;
+        let mut opened = None;
+        source::find_signature(
             &src,
             len,
             &[cfs0002::SIGNATURE, cfs0003::SIGNATURE],
             |at, idx| {
-                if idx == 0 {
+                let plausible = if idx == 0 {
                     cfs0002::plausible(&src, at)
                 } else {
                     cfs0003::Suffix::read(&src, at).is_ok_and(|s| s.plausible(at))
+                };
+                if !plausible || attempts == MAX_OPEN_ATTEMPTS {
+                    return false;
+                }
+                attempts += 1;
+                match assemble(&src, at, idx, &limits) {
+                    Ok(found) => {
+                        opened = Some(found);
+                        true
+                    }
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                        false
+                    }
                 }
             },
-        )?
-        .context(parsers::trailer_error::NoSignature)?;
-
-        let (layout, version) = if which == 0 {
-            (cfs0002::parse(&src, sig_at)?, ArchiveVersion::Cfs0002)
-        } else {
-            let suffix = cfs0003::Suffix::read(&src, sig_at)?;
-            // Before the pgindex, which `KEY_INDEX` encrypts too.
-            let mode = suffix.encryption().mode;
-            ensure!(mode == EncryptionMode::NONE, ctx::Encrypted { mode });
-            (
-                cfs0003::parse(&src, sig_at, &suffix, &limits)?,
-                ArchiveVersion::Cfs0003,
-            )
+        )?;
+        let (layout, version, index) = match (opened, first_error) {
+            (Some(found), _) => found,
+            (None, Some(e)) => return Err(e),
+            (None, None) => return parsers::trailer_error::NoSignature.fail()?,
         };
-
-        let blob = layout.fsindex;
-        let raw = source::at(&src, blob.at, blob.len as usize)?;
-        let plain = blob
-            .decode(&raw, limits.max_fsindex_len)
-            .context(ctx::Decode {
-                blob: Blob::Fsindex,
-            })?;
-        let index = Index::parse(&plain, limits.max_depth)?;
-        check_blocks(&index, layout.pages.len())?;
 
         let sizes: Vec<u32> = layout
             .pages
@@ -261,6 +261,41 @@ impl<R: ReadAt + Size> Archive<R> {
     pub fn walk(&self) -> Vec<(String, Idx<Node>)> {
         self.index.walk()
     }
+}
+
+/// Full opens tried on candidates that pass the cheap check, before the rightmost one's error is reported.
+const MAX_OPEN_ATTEMPTS: usize = 8;
+
+/// Reads the trailer behind the signature at `sig_at` and the tree its fsindex holds.
+fn assemble<R: ReadAt>(
+    src: &R,
+    sig_at: u64,
+    which: usize,
+    limits: &Limits,
+) -> Result<(page::Layout, ArchiveVersion, Index)> {
+    let (layout, version) = if which == 0 {
+        (cfs0002::parse(src, sig_at)?, ArchiveVersion::Cfs0002)
+    } else {
+        let suffix = cfs0003::Suffix::read(src, sig_at)?;
+        // Before the pgindex, which `KEY_INDEX` encrypts too.
+        let mode = suffix.encryption().mode;
+        ensure!(mode == EncryptionMode::NONE, ctx::Encrypted { mode });
+        (
+            cfs0003::parse(src, sig_at, &suffix, limits)?,
+            ArchiveVersion::Cfs0003,
+        )
+    };
+
+    let blob = layout.fsindex;
+    let raw = source::at(src, blob.at, blob.len as usize)?;
+    let plain = blob
+        .decode(&raw, limits.max_fsindex_len)
+        .context(ctx::Decode {
+            blob: Blob::Fsindex,
+        })?;
+    let index = Index::parse(&plain, limits.max_depth)?;
+    check_blocks(&index, layout.pages.len())?;
+    Ok((layout, version, index))
 }
 
 /// Refuses a tree that names a page the archive does not hold.

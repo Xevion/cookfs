@@ -35,6 +35,8 @@
 - A crafted LZMA dictionary size or file size can no longer force a multi-GiB allocation.
 - A source packed with signatures is refused quickly; each hit was a full trailer parse.
 - A stray all-zero trailer no longer opens as an empty archive in place of a damaged one.
+- A decoy trailer after the archive that fails to open no longer hides the real one; when
+  no candidate opens, the error is the rightmost candidate's, not `NoSignature`.
 - The page cache is bounded by decoded bytes, not page count, so pages that decode far larger
   than their compressed size cannot hold gigabytes resident.
 - A file whose blocks cycle through pages stops with `Error::Overdecoded` instead of
