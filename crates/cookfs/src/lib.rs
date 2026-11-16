@@ -48,6 +48,21 @@ pub mod fuzzing {
     pub fn pgindex(data: &[u8]) {
         let _ = crate::parsers::cfs0003::page_table(data, u64::MAX);
     }
+
+    /// Decodes `body` with the codec `id` names, as a `CFS0003` page would be.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the codec reports.
+    pub fn decode(
+        id: u8,
+        body: &[u8],
+        declared: Option<usize>,
+        limit: usize,
+    ) -> Result<Vec<u8>, crate::CodecError> {
+        let expect = crate::codec::Expect { declared, limit };
+        crate::codec::decode(crate::wire::Compression::from_raw(id), body, expect)
+    }
 }
 
 /// Worker count assumed when the OS cannot report available parallelism.
@@ -269,6 +284,8 @@ mod tests {
     use super::*;
     use assert2::check;
     use index::tests::Fsindex;
+
+    mod hostile;
 
     /// A stored `CFS0002` blob: id byte 0, then the payload.
     fn stored(payload: &[u8]) -> Vec<u8> {

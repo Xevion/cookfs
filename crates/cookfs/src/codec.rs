@@ -110,6 +110,10 @@ pub(crate) fn decode_external(
         id != Compression::LEGACY_CUSTOM,
         codec_error::Unknown { id }
     );
+    // Upstream never decodes a `CFS0003` page declared empty, whatever its codec.
+    if expect.declared == Some(0) {
+        return Ok(Vec::new());
+    }
     decode(id, body, expect)
 }
 
@@ -128,10 +132,6 @@ pub(crate) fn decode(id: Compression, body: &[u8], expect: Expect) -> Result<Vec
         }
         None => expect.limit,
     };
-    // Upstream never decodes a page declared empty, whatever its codec.
-    if expect.declared == Some(0) {
-        return Ok(Vec::new());
-    }
 
     let out = match id {
         Compression::NONE => {
@@ -301,7 +301,7 @@ fn raw_lzma1(id: Compression, body: &[u8], declared: usize) -> Result<Vec<u8>, C
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use assert2::check;
     use rstest::rstest;
@@ -316,7 +316,7 @@ mod tests {
         }
     }
 
-    fn deflate(payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn deflate(payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         flate2::read::DeflateEncoder::new(payload, flate2::Compression::default())
             .read_to_end(&mut out)
@@ -324,7 +324,7 @@ mod tests {
         out
     }
 
-    fn lzma_alone_stream(payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn lzma_alone_stream(payload: &[u8]) -> Vec<u8> {
         let options = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
         let stream = liblzma::stream::Stream::new_lzma_encoder(&options).unwrap();
         let mut out = Vec::new();
@@ -335,7 +335,7 @@ mod tests {
     }
 
     /// The 5-byte-header raw LZMA1 shape `CFS0003` writes for id 3.
-    fn raw_lzma1_stream(payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn raw_lzma1_stream(payload: &[u8]) -> Vec<u8> {
         let mut opts = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
         let dict_size = 1u32 << 16;
         opts.dict_size(dict_size);
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[cfg(feature = "codec-bzip2")]
-    fn bzip2_stream(payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn bzip2_stream(payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         bzip2::read::BzEncoder::new(payload, bzip2::Compression::default())
             .read_to_end(&mut out)
@@ -362,14 +362,14 @@ mod tests {
     }
 
     #[cfg(feature = "codec-zstd")]
-    fn zstd_stream(payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn zstd_stream(payload: &[u8]) -> Vec<u8> {
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
         encoder.write_all(payload).unwrap();
         encoder.finish().unwrap()
     }
 
     #[cfg(feature = "codec-brotli")]
-    fn brotli_stream(payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn brotli_stream(payload: &[u8]) -> Vec<u8> {
         let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 9, 22);
         encoder.write_all(payload).unwrap();
         encoder.into_inner()
@@ -488,7 +488,11 @@ mod tests {
 
     #[test]
     fn a_page_declared_empty_is_empty_without_decoding() {
-        check!(decode(Compression::LZMA, &[], exact(0)).unwrap().is_empty());
+        check!(
+            decode_external(Compression::LZMA, &[], exact(0))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[rstest]

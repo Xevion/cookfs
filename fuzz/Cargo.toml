@@ -8,8 +8,14 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4.13"
+libfuzzer-sys = { version = "0.4.13", features = ["arbitrary-derive"] }
 cookfs = { path = "../crates/cookfs" }
+# Encoders for the `structured` target, at the versions the reader decodes with.
+brotli = "8.0.4"
+bzip2 = "0.6.1"
+flate2 = "1.1.9"
+liblzma = "0.4.8"
+zstd = "0.13.3"
 
 [[bin]]
 name = "archive"
@@ -28,6 +34,55 @@ bench = false
 [[bin]]
 name = "pgindex"
 path = "fuzz_targets/pgindex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "structured"
+path = "fuzz_targets/structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_zlib"
+path = "fuzz_targets/codec_zlib.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_bzip2"
+path = "fuzz_targets/codec_bzip2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_lzma"
+path = "fuzz_targets/codec_lzma.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_lzma_alone"
+path = "fuzz_targets/codec_lzma_alone.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_zstd"
+path = "fuzz_targets/codec_zstd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_brotli"
+path = "fuzz_targets/codec_brotli.rs"
 test = false
 doc = false
 bench = false

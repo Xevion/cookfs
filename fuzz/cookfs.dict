@@ -1,0 +1,50 @@
+# libFuzzer dictionary for every cookfs target: `-dict=cookfs.dict`.
+
+# Trailer signatures and the fsindex magic
+"CFS0002"
+"CFS0003"
+"CFS2.200"
+
+# Directory marker, and counts and sizes at their edges
+"\xff\xff\xff\xff"
+"\xff\xff\xff\xfe"
+"\x7f\xff\xff\xff"
+"\x80\x00\x00\x00"
+"\x00\x00\x00\x00"
+"\x00\x00\x00\x01"
+"\x00\x00\x10\x00"
+"\x00\x01\x00\x00"
+
+# An md5-mode slot never starts with eight zero bytes; a crc32-mode slot always does
+"\x00\x00\x00\x00\x00\x00\x00\x00"
+
+# The CFS0003 encryption byte: no encryption at the default level, then each mode
+"\x78"
+"\x79"
+"\x7a"
+"\x7b"
+
+# Codec ids as a CFS0002 blob's first byte names them
+"\x00"
+"\x01"
+"\x02"
+"\x03"
+"\x04"
+"\x05"
+"\xfe"
+"\xff"
+
+# Codec stream headers: zstd frame, bzip2 stream and block, lzma-alone and raw LZMA1 properties
+"\x28\xb5\x2f\xfd"
+"BZh9"
+"BZh1"
+"\x31\x41\x59\x26\x53\x59"
+"\x17\x72\x45\x38\x50\x90"
+"\x5d\x00\x00\x80\x00"
+"\x5d\x00\x00\x01\x00"
+"\xff\xff\xff\xff\xff\xff\xff\xff"
+
+# Metadata keys upstream writes
+"cookfs.pagesize"
+"cookfs.smallfilesize"
+"cookfs.fileset"

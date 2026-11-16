@@ -1,0 +1,15 @@
+file	9	1700000005	a496ea1d	.hidden
+file	12	1700000100	f132a938	added.txt
+dir	0	1690000000	-	data
+file	0	1700000003	00000000	data/empty
+file	27600	1700000002	dbca6e94	data/text.log
+dir	0	1690000000	-	nested
+dir	0	1690000000	-	nested/a
+dir	0	1690000000	-	nested/a/b
+dir	0	1690000000	-	nested/a/b/c
+file	5	1700000004	279eb882	nested/a/b/c/deep.txt
+file	16	1700000100	859c14fe	readme.txt
+dir	0	1690000000	-	small
+file	4	1700000006	f817a89f	small/s1.txt
+file	8	1700000007	ebc7eb45	small/s2.txt
+file	300	1700000008	7172d1b4	small/s3.txt
