@@ -197,7 +197,9 @@ impl<R: ReadAt + Size> Archive<R> {
         let Kind::File(blocks) = &self.index.nodes[node].kind else {
             return Ok(Vec::new());
         };
-        let mut out = Vec::with_capacity(self.index.nodes[node].size() as usize);
+        // The size is a sum the fsindex supplies, so it is not trusted with an allocation.
+        let size = self.index.nodes[node].size();
+        let mut out = Vec::with_capacity(size.min(self.limits.max_page_len as u64) as usize);
         for &Block { page, offset, size } in blocks {
             let data = self.page(page)?;
             let range = offset as usize..offset as usize + size as usize;
@@ -376,6 +378,18 @@ mod tests {
                 exercise(buf);
             }
         }
+    }
+
+    /// Found by the `archive` fuzz target: blocks summing to 4 GiB reserved that much up front.
+    #[test]
+    fn a_file_claiming_gigabytes_fails_without_reserving_them() {
+        let fsindex = Fsindex::new(1)
+            .file("f", &[(0, 0, i32::MAX), (0, 0, i32::MAX)])
+            .finish();
+        let page = (stored(b"0123456789"), cfs0002::tests::crc_slot(10));
+        let archive = open(cfs0002::tests::archive(&[page], &stored(&fsindex))).unwrap();
+        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        check!(let Err(Error::BlockOutOfPage { .. }) = archive.read(idx));
     }
 
     #[test]

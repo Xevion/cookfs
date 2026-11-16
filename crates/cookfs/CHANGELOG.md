@@ -22,6 +22,7 @@
 - A decoded page or index that disagrees with its declared size is an error.
 - An encrypted `CFS0003` archive is refused instead of read as garbage.
 - A deeply nested fsindex can no longer overflow the stack.
+- A crafted LZMA dictionary size or file size can no longer force a multi-GiB allocation.
 
 ## 0.1.0 (2026-08-24)
 

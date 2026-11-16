@@ -10,3 +10,10 @@ allocator abort into a reported out-of-memory.
 | `fsindex` | A decoded fsindex blob |
 | `pgindex` | A decoded `CFS0003` pgindex blob |
 
+## Aborts found
+
+- `Archive::read` reserved a file's size before checking its blocks, and that size is a sum
+  the fsindex supplies. Blocks summing to 4 GiB reserved 4 GiB.
+- An LZMA header's dictionary size was allocated as declared. A crafted 45-byte archive
+  asked for 4 GiB. Dictionary sizes are now clamped to the output limit, which no valid
+  stream can tell apart.

@@ -195,14 +195,37 @@ fn brotli(id: Compression, _: &[u8], _: usize) -> Result<Vec<u8>, CodecError> {
 
 /// BitRock's legacy custom slot: a classic `.lzma`-alone stream, whose 13-byte header the decoder reads itself.
 fn lzma_alone(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
+    const HEADER_LEN: usize = 13;
+    let split = HEADER_LEN.min(body.len());
+    let mut header = [0u8; HEADER_LEN];
+    header[..split].copy_from_slice(&body[..split]);
+    clamp_dictionary(&mut header, limit);
+
     let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
         .map_err(std::io::Error::other)
         .context(codec_error::Decompress { id })?;
+    let input = header[..split].chain(&body[split..]);
     bounded(
         id,
-        liblzma::read::XzDecoder::new_stream(body, stream),
+        liblzma::read::XzDecoder::new_stream(input, stream),
         limit,
     )
+}
+
+/// Lowers an LZMA header's dictionary size to `limit` bytes of output.
+///
+/// The decoder allocates the whole declared dictionary up front, so a crafted
+/// header asking for 4 GiB aborts in the allocator. A match can only reach
+/// back over bytes already decoded, so a dictionary larger than the output is
+/// never used and clamping it changes nothing a valid stream decodes to.
+fn clamp_dictionary(header: &mut [u8], limit: usize) {
+    const MIN_DICTIONARY: u32 = 4096;
+    let Some(dict) = header.get_mut(1..5) else {
+        return;
+    };
+    let declared = u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]);
+    let ceiling = u32::try_from(limit).unwrap_or(u32::MAX).max(MIN_DICTIONARY);
+    dict.copy_from_slice(&declared.min(ceiling).to_le_bytes());
 }
 
 /// `CFS0003`'s raw LZMA1: a properties byte and a little-endian dictionary size, then a stream with no end marker.
@@ -213,10 +236,12 @@ fn lzma_alone(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, Cod
 fn raw_lzma1(id: Compression, body: &[u8], declared: usize) -> Result<Vec<u8>, CodecError> {
     const HEADER_LEN: usize = 5;
     let (header, payload) = body.split_at(HEADER_LEN.min(body.len()));
+    let mut header = header.to_vec();
+    clamp_dictionary(&mut header, declared);
 
     let mut filters = liblzma::stream::Filters::new();
     filters
-        .lzma1_properties(header)
+        .lzma1_properties(&header)
         .map_err(std::io::Error::other)
         .context(codec_error::Decompress { id })?;
     let stream = liblzma::stream::Stream::new_raw_decoder(&filters)
@@ -390,6 +415,18 @@ mod tests {
     #[case::custom(Compression::CUSTOM)]
     fn an_id_without_a_decoder_is_refused(#[case] id: Compression) {
         check!(decode(id, &[1, 2, 3], exact(3)).is_err());
+    }
+
+    /// Found by the `archive` fuzz target: a 4 GiB dictionary was allocated before any byte decoded.
+    #[test]
+    fn a_huge_declared_dictionary_is_clamped_to_the_output() {
+        let mut body = lzma_alone_stream(TEXT);
+        body[1..5].copy_from_slice(&0xFFFF_FFBFu32.to_le_bytes());
+        check!(decode(Compression::LEGACY_CUSTOM, &body, exact(TEXT.len())).unwrap() == TEXT);
+
+        let mut body = raw_lzma1_stream(TEXT);
+        body[1..5].copy_from_slice(&0xFFFF_FFBFu32.to_le_bytes());
+        check!(decode(Compression::LZMA, &body, exact(TEXT.len())).unwrap() == TEXT);
     }
 
     #[test]
