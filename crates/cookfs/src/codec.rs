@@ -153,7 +153,7 @@ pub(crate) fn decode(id: Compression, body: &[u8], expect: Expect) -> Result<Vec
             );
             body.to_vec()
         }
-        Compression::ZLIB => bounded(id, flate2::read::DeflateDecoder::new(body), ceiling)?,
+        Compression::ZLIB => deflate(id, body, ceiling, expect.declared)?,
         Compression::LZMA => {
             let declared = expect.declared.ok_or(CodecError::Unbounded { id })?;
             raw_lzma1(id, body, declared)?
@@ -272,6 +272,112 @@ fn brotli(id: Compression, _: &[u8], _: usize) -> Result<Vec<u8>, CodecError> {
     .fail()
 }
 
+/// What one decoder step reported.
+enum Step {
+    /// Made progress or may with more room; call again.
+    Going,
+    /// The stream ended cleanly.
+    Done,
+    /// No progress is possible: input ran out before the stream ended.
+    Starved,
+}
+
+/// The most a decode reserves per byte of compressed input before its output shows it needs more.
+///
+/// Real pages compress a few times over; the declared or recorded size is what
+/// the archive claims, so a crafted 10-byte page claiming 1 GiB would otherwise
+/// reserve that much up front.
+const RESERVE_RATIO: usize = 1024;
+/// The least a decode reserves, and the least it grows by.
+const MIN_RESERVE: usize = 64 << 10;
+
+/// Runs a decoder that writes into a `Vec`'s spare capacity, until it ends or `target` bytes are out.
+///
+/// Decoding straight into the output skips the doubling and zero-filling a
+/// `read_to_end` pays per page. `hint` sizes the first reservation; growth is
+/// exact, so the output never holds more than `target` bytes.
+fn drain(
+    id: Compression,
+    input_len: usize,
+    hint: usize,
+    target: usize,
+    mut step: impl FnMut(&mut Vec<u8>) -> std::io::Result<Step>,
+) -> Result<Vec<u8>, CodecError> {
+    let reserve = hint
+        .min(input_len.saturating_mul(RESERVE_RATIO).max(MIN_RESERVE))
+        .min(target);
+    let mut out = Vec::with_capacity(reserve);
+    while out.len() < target {
+        if out.len() == out.capacity() {
+            // `with_capacity` is exact for bytes, so the decoder can never write past `target`.
+            let mut grown =
+                Vec::with_capacity(out.len().saturating_mul(2).max(MIN_RESERVE).min(target));
+            grown.extend_from_slice(&out);
+            out = grown;
+        }
+        match step(&mut out).context(codec_error::Decompress { id })? {
+            Step::Done => break,
+            Step::Starved if out.len() < out.capacity() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stream ends before its data does",
+                ))
+                .context(codec_error::Decompress { id });
+            }
+            // A starved step with no room left only needs the room grown above.
+            Step::Going | Step::Starved => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Feeds an LZMA stream from `parts` in order, one decoder step at a time.
+fn lzma_step<'a>(
+    stream: &'a mut liblzma::stream::Stream,
+    parts: [&'a [u8]; 2],
+) -> impl FnMut(&mut Vec<u8>) -> std::io::Result<Step> + 'a {
+    move |out| {
+        let consumed = usize::try_from(stream.total_in()).unwrap_or(usize::MAX);
+        let input = consumed.checked_sub(parts[0].len()).map_or_else(
+            || &parts[0][consumed..],
+            |into_second| parts[1].get(into_second..).unwrap_or_default(),
+        );
+        let status = stream
+            .process_vec(input, out, liblzma::stream::Action::Run)
+            .map_err(std::io::Error::other)?;
+        Ok(match status {
+            liblzma::stream::Status::StreamEnd => Step::Done,
+            liblzma::stream::Status::MemNeeded => Step::Starved,
+            _ => Step::Going,
+        })
+    }
+}
+
+/// Raw deflate, decoded straight into its output.
+fn deflate(
+    id: Compression,
+    body: &[u8],
+    limit: usize,
+    declared: Option<usize>,
+) -> Result<Vec<u8>, CodecError> {
+    let mut inflate = flate2::Decompress::new(false);
+    let target = limit.saturating_add(1);
+    let out = drain(id, body.len(), declared.unwrap_or(limit), target, |out| {
+        let consumed = usize::try_from(inflate.total_in()).unwrap_or(usize::MAX);
+        let input = body.get(consumed..).unwrap_or_default();
+        let status = inflate
+            .decompress_vec(input, out, flate2::FlushDecompress::None)
+            .map_err(std::io::Error::other)?;
+        Ok(match status {
+            flate2::Status::StreamEnd => Step::Done,
+            flate2::Status::BufError => Step::Starved,
+            flate2::Status::Ok => Step::Going,
+        })
+    })?;
+    ensure!(out.len() <= limit, codec_error::TooLarge { id, limit });
+    Ok(out)
+}
+
 /// BitRock's legacy custom slot: a classic `.lzma`-alone stream, whose 13-byte header the decoder reads itself.
 fn lzma_alone(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
     const HEADER_LEN: usize = 13;
@@ -285,15 +391,19 @@ fn lzma_alone(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, Cod
     let output = usize::try_from(recorded).map_or(limit, |n| n.min(limit));
     clamp_dictionary(&mut header, output);
 
-    let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
+    let mut stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
         .map_err(std::io::Error::other)
         .context(codec_error::Decompress { id })?;
-    let input = header[..split].chain(&body[split..]);
-    bounded(
+    let target = limit.saturating_add(1);
+    let out = drain(
         id,
-        liblzma::read::XzDecoder::new_stream(input, stream),
-        limit,
-    )
+        body.len(),
+        output,
+        target,
+        lzma_step(&mut stream, [&header[..split], &body[split..]]),
+    )?;
+    ensure!(out.len() <= limit, codec_error::TooLarge { id, limit });
+    Ok(out)
 }
 
 /// Lowers an LZMA header's dictionary size to `limit` bytes of output.
@@ -315,8 +425,7 @@ fn clamp_dictionary(header: &mut [u8], limit: usize) {
 /// `CFS0003`'s raw LZMA1: a properties byte and a little-endian dictionary size, then a stream with no end marker.
 ///
 /// Without an end marker the decoder never reports a clean end and errors once
-/// input runs out, so the declared size is the only place to stop. Reading one
-/// byte past it, as [`bounded`] does, would run the decoder into that error.
+/// input runs out, so the declared size is the only place to stop.
 fn raw_lzma1(id: Compression, body: &[u8], declared: usize) -> Result<Vec<u8>, CodecError> {
     const HEADER_LEN: usize = 5;
     let (header, payload) = body.split_at(HEADER_LEN.min(body.len()));
@@ -328,16 +437,16 @@ fn raw_lzma1(id: Compression, body: &[u8], declared: usize) -> Result<Vec<u8>, C
         .lzma1_properties(&header)
         .map_err(std::io::Error::other)
         .context(codec_error::Decompress { id })?;
-    let stream = liblzma::stream::Stream::new_raw_decoder(&filters)
+    let mut stream = liblzma::stream::Stream::new_raw_decoder(&filters)
         .map_err(std::io::Error::other)
         .context(codec_error::Decompress { id })?;
-
-    let mut out = Vec::new();
-    liblzma::read::XzDecoder::new_stream(payload, stream)
-        .take(declared as u64)
-        .read_to_end(&mut out)
-        .context(codec_error::Decompress { id })?;
-    Ok(out)
+    drain(
+        id,
+        body.len(),
+        declared,
+        declared,
+        lzma_step(&mut stream, [payload, &[]]),
+    )
 }
 
 #[cfg(test)]

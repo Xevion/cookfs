@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- zlib and LZMA pages decode straight into their output, skipping the doubling and zero-fill
+  of a read loop, and cached pages are no longer copied on the way in. Extracting the largest
+  sample installer takes about 15% less time and 8% less memory.
+
 ## [0.2.0] - 2026-11-16
 
 ### Breaking
