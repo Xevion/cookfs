@@ -30,10 +30,17 @@ zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 assert2.workspace = true
+crc32fast.workspace = true
+libtest-mimic.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 toml.workspace = true
 zip.workspace = true
+
+# One case per corpus sample, so it runs under its own harness.
+[[test]]
+name = "samples"
+harness = false
 
 [features]
 default = ["codec-bzip2", "codec-zstd", "codec-brotli"]

@@ -101,6 +101,13 @@ export default defineConfig({
     }),
 
     task({
+      name: "oracle:cli",
+      body: ["bun", "run", "tools/oracle.ts"],
+      passthrough: true,
+      requires: [BUN, { tool: "tclsh", hint: "Tcl 8.6 with its development files" }, { tool: "xz" }, { tool: "unzip" }],
+    }),
+
+    task({
       name: "secrets:cli",
       body: ["bun", "run", "tools/secrets.ts"],
       passthrough: true,
@@ -124,6 +131,11 @@ export default defineConfig({
     corpus: {
       description: "Manage the sample corpus (status, pull, push, add, verify, prune)",
       tasks: ["corpus:cli"],
+      passthrough: true,
+    },
+    oracle: {
+      description: "Build upstream cookfs and list the corpus as it reads it (build, dump)",
+      tasks: ["oracle:cli"],
       passthrough: true,
     },
     secrets: {

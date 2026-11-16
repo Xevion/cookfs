@@ -67,6 +67,24 @@ jobs:
       - name: Fetch sample corpus
         if: ${{ runner.os == 'Linux' && env.S3_ACCESS_KEY_ID != '' }}
         run: bun run tools/corpus.ts pull
+      # Upstream Tcl cookfs, the oracle the sample tests diff against. Only where the corpus is.
+      - name: Install Tcl
+        if: ${{ runner.os == 'Linux' && env.S3_ACCESS_KEY_ID != '' }}
+        run: sudo apt-get install -y --no-install-recommends tcl-dev
+      - name: Cache the oracle build
+        if: ${{ runner.os == 'Linux' && env.S3_ACCESS_KEY_ID != '' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/oracle/build
+          key: oracle-${{ runner.os }}-${{ hashFiles('tools/oracle.ts') }}
+      - name: Build the oracle and list the corpus through it
+        if: ${{ runner.os == 'Linux' && env.S3_ACCESS_KEY_ID != '' }}
+        timeout-minutes: 10
+        run: |
+          bun run tools/oracle.ts build
+          bun run tools/oracle.ts dump
+          echo "COOKFS_REQUIRE_CORPUS=1" >> "$GITHUB_ENV"
+          echo "COOKFS_REQUIRE_ORACLE=1" >> "$GITHUB_ENV"
       - name: Run tests
         run: cargo nextest run --workspace --all-features
       - name: Run doctests
