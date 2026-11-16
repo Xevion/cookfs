@@ -59,8 +59,23 @@ proc open_archive {path signature opener} {
     error "upstream accepts no $signature trailer in $path: $why"
 }
 
+# A name keeps the raw bytes it was stored with, which the output encoder mis-walks when
+# they are not UTF-8, so each character is rebuilt from its code point. Tcl 8.6 cannot
+# build one past U+FFFF, but those already print correctly. A lone surrogate has no
+# UTF-8 form, so it is listed as U+FFFD.
 proc emit {kind size mtime crc path} {
-    puts [join [list $kind $size $mtime $crc $path] \t]
+    set clean {}
+    foreach ch [split $path ""] {
+        scan $ch %c cp
+        if {$cp > 0xFFFF} {
+            append clean $ch
+        } elseif {$cp >= 0xD800 && $cp <= 0xDFFF} {
+            append clean \uFFFD
+        } else {
+            append clean [format %c $cp]
+        }
+    }
+    puts [join [list $kind $size $mtime $crc $clean] \t]
 }
 
 proc crc {data} {

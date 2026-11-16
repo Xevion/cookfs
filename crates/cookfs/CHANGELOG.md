@@ -46,6 +46,9 @@
 - A page the pgindex flags as encrypted is refused instead of returned as plaintext.
 - A name repeated in one directory keeps its last entry, as upstream does, and a file and
   directory sharing a name are refused.
+- Names decode as the Tcl runtime that wrote them reads them: `C0 80` is NUL, a CESU-8
+  surrogate pair is one character, a byte that is not UTF-8 is its Latin-1 character, and a
+  raw NUL ends the name. Distinct names that once all read as U+FFFD stay distinct.
 - An fsindex with no metadata section, as archives before 2011 have, parses.
 - Bytes after the last pgindex record are refused, as upstream does.
 - A blob naming a codec its format cannot hold is refused: zstd or brotli in `CFS0002`,

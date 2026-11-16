@@ -389,6 +389,17 @@ switch -- $flavor {
         legacy_crafted [file join $outdir v2-latin1-names.cfs] 2 \
             "[raw_entry "\xff" {0 0 3}][raw_entry "x\xfey" {0 3 3}]"
         puts v2-latin1-names
+        # Each byte shape Tcl's UTF-8 reader treats specially: overlongs, surrogates, truncations, strays.
+        set edges {}
+        foreach name {
+            "o\xc1\xbf" "z\xe0\x80\x80" "p\xed\xa0\xbd\xed\xb8\x80" "s\xed\xa0\x80"
+            "t\xc3" "u\xc3x" "c\x80" "f\xf0\x9f\x98\x80" "g\xf8\x88\x80\x80\x80"
+            "h\xe2\x82" "i\xe2\x82x"
+        } {
+            append edges [raw_entry [subst $name] {0 0 1}]
+        }
+        legacy_crafted [file join $outdir v2-utf8-edges.cfs] 11 $edges
+        puts v2-utf8-edges
         legacy [file join $outdir v2-always.cfs] zlib md5 4096 {pageopts -alwayscompress}
         puts v2-always
 

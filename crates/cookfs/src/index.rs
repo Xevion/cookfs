@@ -194,8 +194,7 @@ impl Index {
             let parent = *dir;
 
             let len = r.u8().context(index_error::Truncated)?;
-            let name = String::from_utf8_lossy(r.take(len.into()).context(index_error::Truncated)?)
-                .into_owned();
+            let name = crate::name::decode(r.take(len.into()).context(index_error::Truncated)?);
             r.take(1).context(index_error::Truncated)?; // the name's NUL
             let head = r.record::<EntryHead>().context(index_error::Truncated)?;
 

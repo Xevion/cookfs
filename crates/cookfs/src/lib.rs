@@ -11,6 +11,7 @@ mod codec;
 mod error;
 mod index;
 mod limits;
+mod name;
 mod page;
 mod parsers;
 mod source;

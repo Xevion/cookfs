@@ -207,28 +207,10 @@ fn trial(sample: Sample, dir: &Path, listings: &Path) -> Trial {
 }
 
 /// Fixtures this crate reads differently from upstream, ignored until fixed, each with the bug it shows.
-const KNOWN_BUGS: &[(&str, &str)] = &[
-    (
-        "v2-names",
-        "BUG: Tcl stores NUL in a name as C0 80, which reads back as two U+FFFD instead of NUL",
-    ),
-    (
-        "v3-tcl-names",
-        "BUG: Tcl stores NUL in a name as C0 80, which reads back as two U+FFFD instead of NUL",
-    ),
-    (
-        "v2-latin1-names",
-        "BUG: name bytes that are not UTF-8 read as U+FFFD, where upstream reads each as a Latin-1 char",
-    ),
-    (
-        "v2-raw-nul",
-        "BUG: a name holding a raw NUL keeps the bytes after it, where upstream ends the name there",
-    ),
-    (
-        "v3-fileset",
-        "BUG: a fileset archive lists its fileset directory at the root instead of mounting it there",
-    ),
-];
+const KNOWN_BUGS: &[(&str, &str)] = &[(
+    "v3-fileset",
+    "BUG: a fileset archive lists its fileset directory at the root instead of mounting it there",
+)];
 
 /// Archives upstream wrote for cases the corpus lacks, each beside upstream's listing of it.
 fn fixtures() -> Vec<Trial> {
