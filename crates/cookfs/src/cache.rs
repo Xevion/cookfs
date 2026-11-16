@@ -1,6 +1,6 @@
 //! Bounded page cache.
 //!
-//! Pages are handed out as `Arc<[u8]>` so a hit never copies. The policy is LRU
+//! Pages are handed out as `Arc<Vec<u8>>` so a hit never copies. The policy is LRU
 //! with a per-page load gate, chosen from measurements over a corpus of real
 //! installers rather than from first principles.
 
@@ -11,7 +11,10 @@ use lru::LruCache;
 use parking_lot::Mutex;
 
 /// A decompressed page, shared by every reader that asked for it.
-pub(crate) type Page = Arc<[u8]>;
+///
+/// A `Vec` rather than `[u8]` behind the `Arc`, since converting a decoded
+/// `Vec` into `Arc<[u8]>` copies the whole page into a new allocation.
+pub(crate) type Page = Arc<Vec<u8>>;
 
 /// How many decoded bytes the cache may retain, derived from an archive's own page sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +122,10 @@ impl PageCache {
         if let Some(hit) = guard.as_ref() {
             return Ok(hit.clone());
         }
-        let page: Page = load()?.into();
+        let mut decoded = load()?;
+        // A decoder reserves ahead of what it proves it needs; a cached page keeps only its bytes.
+        decoded.shrink_to_fit();
+        let page: Page = Arc::new(decoded);
         *guard = Some(page.clone());
         drop(guard);
         self.admit(n, &slot, page.len());
