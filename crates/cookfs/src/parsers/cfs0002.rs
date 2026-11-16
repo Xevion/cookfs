@@ -17,7 +17,7 @@ use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 use super::{TrailerError, addressable, before, trailer_error};
-use crate::page::{BlobRef, Codec, Layout};
+use crate::page::{BlobRef, Codec, Hash, Layout};
 use crate::source;
 use crate::wire::Compression;
 
@@ -118,6 +118,7 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
                 codec: Codec::Prefixed,
                 declared: slot.declared_len(),
                 encrypted: false,
+                hash: Hash::from_slot(slot.0),
             };
             at += u64::from(size.get());
             page
@@ -132,6 +133,7 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
             codec: Codec::Prefixed,
             declared: None,
             encrypted: false,
+            hash: Hash::Unhashed,
         },
         encryption: None,
     })
@@ -171,11 +173,18 @@ pub(crate) mod tests {
         buf
     }
 
-    /// A `crc32`-mode slot recording `len`, with a zero checksum.
-    pub(crate) fn crc_slot(len: u32) -> [u8; 16] {
+    /// The `crc32`-mode slot upstream writes for a page that decodes to `decoded`.
+    pub(crate) fn crc_slot(decoded: &[u8]) -> [u8; 16] {
         let mut slot = [0u8; 16];
-        slot[8..12].copy_from_slice(&len.to_be_bytes());
+        slot[8..12].copy_from_slice(&(decoded.len() as u32).to_be_bytes());
+        slot[12..].copy_from_slice(&crc32fast::hash(decoded).to_be_bytes());
         slot
+    }
+
+    /// The `md5`-mode slot upstream writes for a page that decodes to `decoded`.
+    pub(crate) fn md5_slot(decoded: &[u8]) -> [u8; 16] {
+        use md5::Digest;
+        md5::Md5::digest(decoded).into()
     }
 
     fn sig_at(buf: &[u8]) -> u64 {
@@ -185,7 +194,10 @@ pub(crate) mod tests {
     #[test]
     fn pages_are_located_by_summing_sizes_backward_from_the_trailer() {
         let buf = archive(
-            &[(vec![0; 10], crc_slot(100)), (vec![0; 20], crc_slot(200))],
+            &[
+                (vec![0; 10], crc_slot(&[0; 100])),
+                (vec![0; 20], crc_slot(&[0; 200])),
+            ],
             b"fsindex",
         );
         let layout = parse(&buf.as_slice(), sig_at(&buf)).unwrap();
@@ -205,7 +217,7 @@ pub(crate) mod tests {
         md5[8..12].copy_from_slice(&100u32.to_be_bytes());
         check!(Slot(md5).declared_len().is_none());
         check!(Slot([0; 16]).declared_len().is_none());
-        check!(Slot(crc_slot(100)).declared_len() == Some(100));
+        check!(Slot(crc_slot(&[0; 100])).declared_len() == Some(100));
     }
 
     #[test]
@@ -216,7 +228,7 @@ pub(crate) mod tests {
 
     #[test]
     fn plausibility_needs_an_fsindex_with_a_legacy_codec_that_fits() {
-        let real = archive(&[(vec![0; 10], crc_slot(10))], &[1, 2, 3]);
+        let real = archive(&[(vec![0; 10], crc_slot(&[0; 10]))], &[1, 2, 3]);
         check!(plausible(&real.as_slice(), sig_at(&real)));
 
         let zeros = archive(&[], b"");

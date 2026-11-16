@@ -18,7 +18,7 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 use super::{TrailerError, addressable, before, trailer_error};
 use crate::Limits;
 use crate::bytes::Reader;
-use crate::page::{BlobRef, Codec, Layout};
+use crate::page::{BlobRef, Codec, Hash, Layout};
 use crate::source;
 use crate::wire::Compression;
 
@@ -136,6 +136,7 @@ pub(crate) fn parse<R: ReadAt>(
     sig_at: u64,
     suffix: &Suffix,
     limits: &Limits,
+    verify: bool,
 ) -> Result<Layout, TrailerError> {
     let suffix_at = before("trailer suffix", sig_at, SUFFIX_LEN)?;
 
@@ -152,7 +153,7 @@ pub(crate) fn parse<R: ReadAt>(
         let raw = source::at(src, pgindex_at, addressable("pgindex", pgindex_len.into())?)
             .context(trailer_error::Read)?;
         let plain = pgindex
-            .decode(&raw, limits.max_page_len)
+            .decode(&raw, limits.max_page_len, verify)
             .context(trailer_error::PgindexBlob)?;
         page_table(&plain, pgindex_at)?
     };
@@ -164,13 +165,14 @@ pub(crate) fn parse<R: ReadAt>(
     })
 }
 
-const fn blob(at: u64, info: BlobInfo) -> BlobRef {
+fn blob(at: u64, info: BlobInfo) -> BlobRef {
     BlobRef {
         at,
         len: info.size_compressed.get(),
         codec: Codec::External(Compression::from_raw(info.compression)),
         declared: Some(info.size_uncompressed.get()),
         encrypted: false,
+        hash: Hash::from_slot(info.md5),
     }
 }
 
@@ -199,7 +201,8 @@ pub(crate) fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, Trailer
     let uncompressed = r
         .records::<U32>(count)
         .context(trailer_error::PgindexLayout)?;
-    r.records::<[u8; 16]>(count)
+    let hashes = r
+        .records::<[u8; 16]>(count)
         .context(trailer_error::PgindexLayout)?;
     snafu::ensure!(
         r.remaining() == 0,
@@ -216,13 +219,15 @@ pub(crate) fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, Trailer
         .zip(encrypted)
         .zip(compressed)
         .zip(uncompressed)
-        .map(|(((&id, &flag), len), declared)| {
+        .zip(hashes)
+        .map(|((((&id, &flag), len), declared), &hash)| {
             let page = BlobRef {
                 at,
                 len: len.get(),
                 codec: Codec::External(Compression::from_raw(id)),
                 declared: Some(declared.get()),
                 encrypted: flag != 0,
+                hash: Hash::from_slot(hash),
             };
             at += u64::from(len.get());
             page
@@ -285,7 +290,14 @@ pub(crate) mod tests {
     fn pages_are_located_before_the_pgindex() {
         let buf = archive(&[vec![1; 10], vec![2; 20]], b"fsindex", 0);
         let suffix = Suffix::read(&buf.as_slice(), sig_at(&buf)).unwrap();
-        let layout = parse(&buf.as_slice(), sig_at(&buf), &suffix, &Limits::default()).unwrap();
+        let layout = parse(
+            &buf.as_slice(),
+            sig_at(&buf),
+            &suffix,
+            &Limits::default(),
+            true,
+        )
+        .unwrap();
         let got: Vec<_> = layout.pages.iter().map(|p| (p.at, p.len)).collect();
         check!(got == [(0, 10), (10, 20)]);
     }
@@ -314,7 +326,7 @@ pub(crate) mod tests {
         buf.extend_from_slice(SIGNATURE);
         let suffix = Suffix::read(&buf.as_slice(), 55).unwrap();
         check!(!suffix.plausible(55));
-        check!(let Err(TrailerError::NoFsindex) = parse(&buf.as_slice(), 55, &suffix, &Limits::default()));
+        check!(let Err(TrailerError::NoFsindex) = parse(&buf.as_slice(), 55, &suffix, &Limits::default(), true));
     }
 
     #[test]

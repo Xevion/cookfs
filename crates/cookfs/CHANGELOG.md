@@ -19,6 +19,12 @@
 - `Limits` gains `max_file_len` (1 GiB by default), past which `Archive::read` refuses a file.
 - A directory's children are sorted by name.
 
+### Added
+
+- Every page, pgindex and fsindex is checked against the MD5 or CRC-32 the archive stores for
+  it, failing with `CodecError::HashMismatch`. On by default; `OpenOptions::verify` turns it
+  off. Blobs written without a hash are not checked.
+
 ### Fixed
 
 - A `CFS0002` archive written in the default `md5` hash mode reads correctly. Its hash slots

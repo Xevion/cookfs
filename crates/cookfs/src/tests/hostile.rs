@@ -94,9 +94,6 @@ const MIB: usize = 1 << 20;
 /// The text every compressed test page holds.
 const TEXT: &[u8] = b"the quick brown fox jumps over the lazy dog, and the dog sleeps on";
 
-/// An `md5`-mode slot: a digest-shaped value, which declares no size.
-const MD5_SLOT: [u8; 16] = [0xA5; 16];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Width {
     U8,
@@ -323,22 +320,22 @@ fn lzma_alone_page(b: &mut Buf, page: usize) {
 
 /// A `CFS0002` archive over stored, zlib, `.lzma`-alone and (with the feature) bzip2 pages.
 fn v2_base() -> Buf {
-    let mut pages: Vec<(Buf, Option<u32>)> = Vec::new();
+    let mut pages: Vec<(Buf, Option<u32>, &[u8])> = Vec::new();
 
     let mut p = Buf::default();
     p.put("page 0 codec", Width::U8, 0);
     p.raw(b"0123456789abcdef");
-    pages.push((p, Some(16)));
+    pages.push((p, Some(16), b"0123456789abcdef"));
 
     let mut p = Buf::default();
     p.put("page 1 codec", Width::U8, 1);
     p.raw(&deflate(TEXT));
-    pages.push((p, None));
+    pages.push((p, None, TEXT));
 
     let mut p = Buf::default();
     p.put("page 2 codec", Width::U8, 255);
     lzma_alone_page(&mut p, 2);
-    pages.push((p, Some(TEXT.len() as u32)));
+    pages.push((p, Some(TEXT.len() as u32), TEXT));
 
     #[cfg(feature = "codec-bzip2")]
     {
@@ -346,7 +343,7 @@ fn v2_base() -> Buf {
         p.put("page 3 codec", Width::U8, 2);
         p.put("page 3 bzip2 size", Width::Be32, TEXT.len() as u64);
         p.raw(&crate::codec::tests::bzip2_stream(TEXT));
-        pages.push((p, None));
+        pages.push((p, None, TEXT));
     }
 
     let text_pages: Vec<i32> = (1..pages.len() as i32).collect();
@@ -355,19 +352,19 @@ fn v2_base() -> Buf {
     index.nest(fsindex(&tree(&text_pages), &[b"key\0value", b""]));
 
     let mut out = Buf::default();
-    let lens: Vec<usize> = pages.iter().map(|(p, _)| p.bytes.len()).collect();
-    let declared: Vec<Option<u32>> = pages.iter().map(|&(_, d)| d).collect();
-    for (p, _) in pages {
+    let lens: Vec<usize> = pages.iter().map(|(p, _, _)| p.bytes.len()).collect();
+    let slots: Vec<(Option<u32>, &[u8])> = pages.iter().map(|&(_, d, text)| (d, text)).collect();
+    for (p, _, _) in pages {
         out.nest(p);
     }
-    for (i, declared) in declared.iter().enumerate() {
+    for (i, &(declared, decoded)) in slots.iter().enumerate() {
         match declared {
             Some(len) => {
                 out.raw(&[0; 8]);
-                out.put(format!("page {i} slot size"), Width::Be32, (*len).into());
-                out.raw(&[0; 4]);
+                out.put(format!("page {i} slot size"), Width::Be32, len.into());
+                out.raw(&crc32fast::hash(decoded).to_be_bytes());
             }
-            None => out.raw(&MD5_SLOT),
+            None => out.raw(&cfs0002::tests::md5_slot(decoded)),
         }
     }
     for (i, len) in lens.iter().enumerate() {
@@ -506,7 +503,10 @@ const TIME_BOUND: Duration = Duration::from_secs(2);
 
 /// Opens `buf` under tight limits and reads every file, returning what broke a bound.
 fn bounded(buf: Vec<u8>) -> Result<(), String> {
-    let opts = OpenOptions { limits: TIGHT };
+    let opts = OpenOptions {
+        limits: TIGHT,
+        ..OpenOptions::default()
+    };
     let started = Instant::now();
     let (outcome, held) = peak(move || {
         catch_unwind(AssertUnwindSafe(move || -> Result<(), String> {
@@ -560,7 +560,13 @@ fn sweep(base: &Buf) -> (usize, Vec<String>) {
 }
 
 fn read_all(buf: Vec<u8>, limits: Limits) -> Result<BTreeMap<String, Option<Vec<u8>>>, Error> {
-    let archive = Archive::open(buf, &OpenOptions { limits })?;
+    let archive = Archive::open(
+        buf,
+        &OpenOptions {
+            limits,
+            ..OpenOptions::default()
+        },
+    )?;
     archive
         .walk()
         .into_iter()
@@ -734,9 +740,9 @@ fn build_v2(files: &BTreeMap<Vec<String>, Vec<u8>>, page_len: usize, codecs: &[b
                 page.clone()
             });
             let slot = if deflated {
-                MD5_SLOT
+                cfs0002::tests::md5_slot(page)
             } else {
-                cfs0002::tests::crc_slot(page.len() as u32)
+                cfs0002::tests::crc_slot(page)
             };
             (blob, slot)
         })
@@ -886,13 +892,15 @@ fn the_page_cache_stays_under_its_ceiling_when_pages_declare_no_size() {
     }
     let mut index = vec![0u8];
     index.extend_from_slice(&fs.finish());
-    let pages: Vec<_> = (0..PAGES).map(|_| (page.clone(), MD5_SLOT)).collect();
+    let slot = cfs0002::tests::md5_slot(&vec![0; 8 * MIB]);
+    let pages: Vec<_> = (0..PAGES).map(|_| (page.clone(), slot)).collect();
     let buf = cfs0002::tests::archive(&pages, &index);
     let opts = OpenOptions {
         limits: Limits {
             max_page_len: 8 * MIB,
             ..Limits::default()
         },
+        ..OpenOptions::default()
     };
 
     let archive = Archive::open(buf, &opts).unwrap();
@@ -911,7 +919,10 @@ fn the_page_cache_stays_under_its_ceiling_when_pages_declare_no_size() {
 #[test]
 fn a_read_that_fails_reserves_no_more_than_its_pages_hold() {
     let fsindex = Fsindex::new(1).file("f", &[(0, 0, i32::MAX)]).finish();
-    let page = (super::stored(b"0123456789"), cfs0002::tests::crc_slot(10));
+    let page = (
+        super::stored(b"0123456789"),
+        cfs0002::tests::crc_slot(b"0123456789"),
+    );
     let archive = super::open(cfs0002::tests::archive(&[page], &super::stored(&fsindex))).unwrap();
     let (_, idx) = archive.walk().into_iter().next().unwrap();
     let (got, held) = peak(|| archive.read(idx));
@@ -984,7 +995,10 @@ fn a_zero_size_block_is_skipped_whatever_its_page_and_offset() {
     let fsindex = Fsindex::new(1)
         .file("f", &[(i32::MIN, i32::MIN, 0), (0, 2, 3), (-7, -7, 0)])
         .finish();
-    let page = (super::stored(b"0123456789"), cfs0002::tests::crc_slot(10));
+    let page = (
+        super::stored(b"0123456789"),
+        cfs0002::tests::crc_slot(b"0123456789"),
+    );
     let archive = super::open(cfs0002::tests::archive(&[page], &super::stored(&fsindex))).unwrap();
     let (_, idx) = archive.walk().into_iter().next().unwrap();
     assert!(let Kind::File(blocks) = &archive.node(idx).kind);
@@ -1000,7 +1014,10 @@ fn a_block_ending_exactly_at_its_page_reads_and_one_byte_more_does_not() {
         .file("past", &[(0, 9, 2)])
         .file("far", &[(0, i32::MAX, i32::MAX)])
         .finish();
-    let page = (super::stored(b"0123456789"), cfs0002::tests::crc_slot(10));
+    let page = (
+        super::stored(b"0123456789"),
+        cfs0002::tests::crc_slot(b"0123456789"),
+    );
     let archive = super::open(cfs0002::tests::archive(&[page], &super::stored(&fsindex))).unwrap();
     let files: BTreeMap<String, _> = archive.walk().into_iter().collect();
     check!(archive.read(files["end"]).unwrap() == b"9");
@@ -1015,7 +1032,10 @@ fn a_page_under_every_block_of_a_file_reads_it_that_many_times() {
     let fsindex = Fsindex::new(1)
         .file("f", &vec![(0, 0, 10); BLOCKS])
         .finish();
-    let page = (super::stored(b"0123456789"), cfs0002::tests::crc_slot(10));
+    let page = (
+        super::stored(b"0123456789"),
+        cfs0002::tests::crc_slot(b"0123456789"),
+    );
     let archive = super::open(cfs0002::tests::archive(&[page], &super::stored(&fsindex))).unwrap();
     let (_, idx) = archive.walk().into_iter().next().unwrap();
     let started = Instant::now();

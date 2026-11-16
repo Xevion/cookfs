@@ -58,6 +58,12 @@ pub enum CodecError {
         /// The size actually produced.
         got: usize,
     },
+    /// The decoded bytes do not hash to what the archive stored for them.
+    #[snafu(display("decoded bytes fail their {hash} check"))]
+    HashMismatch {
+        /// Which hash the archive stored.
+        hash: &'static str,
+    },
     /// Raw LZMA1 has no end marker, so it cannot be decoded without a declared size.
     #[snafu(display("{id} blob has no declared size to stop at"))]
     Unbounded {

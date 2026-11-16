@@ -70,11 +70,25 @@ pub mod fuzzing {
 const WORKERS_FALLBACK: usize = 4;
 
 /// What [`Archive::open`] needs to know beyond the source.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct OpenOptions {
     /// Ceilings on what the archive's own bytes can make the reader allocate.
     pub limits: Limits,
+    /// Whether every page and index is checked against the hash the archive stores for it.
+    ///
+    /// On by default. Upstream writes an MD5 or CRC-32 of each decoded blob;
+    /// one written without a hash is never checked either way.
+    pub verify: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            verify: true,
+        }
+    }
 }
 
 /// Which trailer format an archive was opened as.
@@ -99,6 +113,7 @@ pub struct Archive<R> {
     index: Index,
     cache: PageCache,
     limits: Limits,
+    verify: bool,
     encryption: Option<Encryption>,
 }
 
@@ -137,7 +152,7 @@ impl<R: ReadAt + Size> Archive<R> {
                     return false;
                 }
                 attempts += 1;
-                match assemble(&src, at, idx, &limits) {
+                match assemble(&src, at, idx, opts) {
                     Ok(found) => {
                         opened = Some(found);
                         true
@@ -170,6 +185,7 @@ impl<R: ReadAt + Size> Archive<R> {
             index,
             cache: PageCache::new(Budget::from_pages(&sizes, workers)),
             limits,
+            verify: opts.verify,
             encryption: layout.encryption,
         })
     }
@@ -194,7 +210,7 @@ impl<R: ReadAt + Size> Archive<R> {
         ensure!(!blob.encrypted, ctx::EncryptedPage { page: n });
         self.cache.get_or_load(n as usize, || {
             let raw = source::at(&self.src, blob.at, blob.len as usize)?;
-            blob.decode(&raw, self.limits.max_page_len)
+            blob.decode(&raw, self.limits.max_page_len, self.verify)
                 .context(ctx::Decode {
                     blob: Blob::Page(n),
                 })
@@ -272,8 +288,9 @@ fn assemble<R: ReadAt>(
     src: &R,
     sig_at: u64,
     which: usize,
-    limits: &Limits,
+    opts: &OpenOptions,
 ) -> Result<(page::Layout, ArchiveVersion, Index)> {
+    let limits = &opts.limits;
     let (layout, version) = if which == 0 {
         (cfs0002::parse(src, sig_at)?, ArchiveVersion::Cfs0002)
     } else {
@@ -282,7 +299,7 @@ fn assemble<R: ReadAt>(
         let mode = suffix.encryption().mode;
         ensure!(mode == EncryptionMode::NONE, ctx::Encrypted { mode });
         (
-            cfs0003::parse(src, sig_at, &suffix, limits)?,
+            cfs0003::parse(src, sig_at, &suffix, limits, opts.verify)?,
             ArchiveVersion::Cfs0003,
         )
     };
@@ -290,7 +307,7 @@ fn assemble<R: ReadAt>(
     let blob = layout.fsindex;
     let raw = source::at(src, blob.at, blob.len as usize)?;
     let plain = blob
-        .decode(&raw, limits.max_fsindex_len)
+        .decode(&raw, limits.max_fsindex_len, opts.verify)
         .context(ctx::Decode {
             blob: Blob::Fsindex,
         })?;
@@ -339,10 +356,7 @@ mod tests {
         let fsindex = Fsindex::new(1)
             .file("hello.txt", &[(0, 0, payload.len() as i32)])
             .finish();
-        let page = (
-            stored(payload),
-            cfs0002::tests::crc_slot(payload.len() as u32),
-        );
+        let page = (stored(payload), cfs0002::tests::crc_slot(payload));
         cfs0002::tests::archive(&[page], &stored(&fsindex))
     }
 
@@ -400,7 +414,10 @@ mod tests {
     #[test]
     fn a_block_running_past_its_page_is_an_error() {
         let fsindex = Fsindex::new(1).file("f", &[(0, 8, 9)]).finish();
-        let page = (stored(b"0123456789"), cfs0002::tests::crc_slot(10));
+        let page = (
+            stored(b"0123456789"),
+            cfs0002::tests::crc_slot(b"0123456789"),
+        );
         let archive = open(cfs0002::tests::archive(&[page], &stored(&fsindex))).unwrap();
         let (_, idx) = archive.walk().into_iter().next().unwrap();
         check!(let Err(Error::BlockOutOfPage { page: 0, page_len: 10, .. }) = archive.read(idx));
@@ -415,6 +432,7 @@ mod tests {
                 max_file_len: 1 << 20,
                 max_depth: 16,
             },
+            ..OpenOptions::default()
         };
         if let Ok(archive) = Archive::open(buf, &opts) {
             for (_, idx) in archive.walk() {
@@ -462,7 +480,10 @@ mod tests {
         let fsindex = Fsindex::new(1)
             .file("f", &[(0, 0, i32::MAX), (0, 0, i32::MAX)])
             .finish();
-        let page = (stored(b"0123456789"), cfs0002::tests::crc_slot(10));
+        let page = (
+            stored(b"0123456789"),
+            cfs0002::tests::crc_slot(b"0123456789"),
+        );
         let archive = open(cfs0002::tests::archive(&[page], &stored(&fsindex))).unwrap();
         let (_, idx) = archive.walk().into_iter().next().unwrap();
         check!(let Err(Error::FileTooLarge { size: 4_294_967_294, .. }) = archive.read(idx));
@@ -473,13 +494,20 @@ mod tests {
     fn blocks_repeating_one_page_cannot_pass_the_file_limit() {
         let blocks = vec![(0, 0, 1000); 2000];
         let fsindex = Fsindex::new(1).file("f", &blocks).finish();
-        let page = (stored(&[7; 1000]), cfs0002::tests::crc_slot(1000));
+        let page = (stored(&[7; 1000]), cfs0002::tests::crc_slot(&[7; 1000]));
         let buf = cfs0002::tests::archive(&[page], &stored(&fsindex));
         let limits = Limits {
             max_file_len: 1 << 20,
             ..Limits::default()
         };
-        let archive = Archive::open(buf, &OpenOptions { limits }).unwrap();
+        let archive = Archive::open(
+            buf,
+            &OpenOptions {
+                limits,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
         let (_, idx) = archive.walk().into_iter().next().unwrap();
         check!(let Err(Error::FileTooLarge { size: 2_000_000, .. }) = archive.read(idx));
     }
@@ -489,13 +517,20 @@ mod tests {
     fn blocks_cycling_through_pages_stop_the_read() {
         let blocks: Vec<_> = (0..30).map(|i| (i % 3, 0, 1)).collect();
         let fsindex = Fsindex::new(1).file("f", &blocks).finish();
-        let page = |b| (stored(&[b; 1000]), cfs0002::tests::crc_slot(1000));
+        let page = |b| (stored(&[b; 1000]), cfs0002::tests::crc_slot(&[b; 1000]));
         let buf = cfs0002::tests::archive(&[page(1), page(2), page(3)], &stored(&fsindex));
         let limits = Limits {
             max_page_len: 1000,
             ..Limits::default()
         };
-        let archive = Archive::open(buf, &OpenOptions { limits }).unwrap();
+        let archive = Archive::open(
+            buf,
+            &OpenOptions {
+                limits,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
         let (_, idx) = archive.walk().into_iter().next().unwrap();
         check!(let Err(Error::Overdecoded { size: 30, decoded: 3000 }) = archive.read(idx));
     }
@@ -506,8 +541,8 @@ mod tests {
             .file("f", &[(0, 0, 2), (1, 0, 2), (0, 2, 2)])
             .finish();
         let pages = [
-            (stored(b"abcd"), cfs0002::tests::crc_slot(4)),
-            (stored(b"wxyz"), cfs0002::tests::crc_slot(4)),
+            (stored(b"abcd"), cfs0002::tests::crc_slot(b"abcd")),
+            (stored(b"wxyz"), cfs0002::tests::crc_slot(b"wxyz")),
         ];
         let archive = open(cfs0002::tests::archive(&pages, &stored(&fsindex))).unwrap();
         let (_, idx) = archive.walk().into_iter().next().unwrap();
@@ -533,6 +568,51 @@ mod tests {
         let archive = open(buf).unwrap();
         let (_, idx) = archive.walk().into_iter().next().unwrap();
         check!(let Err(Error::EncryptedPage { page: 0 }) = archive.read(idx));
+    }
+
+    /// A stored page whose bytes changed after its `crc32` slot was written.
+    #[test]
+    fn a_page_failing_its_hash_is_refused_unless_verification_is_off() {
+        let fsindex = Fsindex::new(1).file("f", &[(0, 0, 5)]).finish();
+        let page = (stored(b"hellp"), cfs0002::tests::crc_slot(b"hello"));
+        let buf = cfs0002::tests::archive(&[page], &stored(&fsindex));
+
+        let archive = open(buf.clone()).unwrap();
+        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        check!(let Err(Error::Decode { blob: Blob::Page(0), source: CodecError::HashMismatch { hash: "CRC-32" } }) = archive.read(idx));
+
+        let lax = OpenOptions {
+            verify: false,
+            ..OpenOptions::default()
+        };
+        let archive = Archive::open(buf, &lax).unwrap();
+        check!(archive.read(idx).unwrap() == b"hellp");
+    }
+
+    /// Flipping one byte of every page or index blob in a real archive is caught by its MD5.
+    #[test]
+    fn a_corrupted_byte_in_an_upstream_archive_fails_its_md5() {
+        // Pages start after upstream's 15-byte `CFSS003` stamp, which no hash covers.
+        const STAMP: usize = 15;
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v3-none.cfs");
+        let clean = std::fs::read(fixture).unwrap();
+        let read_all = |buf: Vec<u8>| -> Result<()> {
+            let archive = open(buf)?;
+            for (_, idx) in archive.walk() {
+                archive.read(idx)?;
+            }
+            Ok(())
+        };
+        check!(read_all(clean.clone()).is_ok());
+        let tail = clean.len() - cfs0003::SIGNATURE.len() - 55;
+        let mut caught = 0;
+        for at in (STAMP..tail).step_by(97) {
+            let mut buf = clean.clone();
+            buf[at] ^= 0x01;
+            caught += usize::from(read_all(buf).is_err());
+        }
+        check!(caught == (tail - STAMP).div_ceil(97));
     }
 
     /// A stray all-zero trailer before a damaged archive once opened as an empty one.
@@ -566,6 +646,7 @@ mod tests {
                 max_fsindex_len: 4,
                 ..Limits::default()
             },
+            ..OpenOptions::default()
         };
         let check = Archive::open(one_file_v2(b"x"), &opts);
         check!(let Err(Error::Decode { blob: Blob::Fsindex, source: CodecError::TooLarge { limit: 4, .. } }) = check);

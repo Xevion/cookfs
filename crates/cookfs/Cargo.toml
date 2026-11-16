@@ -18,10 +18,12 @@ arbitrary-int.workspace = true
 bitbybit.workspace = true
 brotli = { workspace = true, optional = true }
 bzip2 = { workspace = true, optional = true }
+crc32fast.workspace = true
 flate2.workspace = true
 la-arena.workspace = true
 liblzma.workspace = true
 lru.workspace = true
+md-5.workspace = true
 parking_lot.workspace = true
 positioned-io.workspace = true
 snafu.workspace = true
@@ -30,7 +32,6 @@ zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 assert2.workspace = true
-crc32fast.workspace = true
 libtest-mimic.workspace = true
 proptest.workspace = true
 rstest.workspace = true
@@ -41,6 +42,10 @@ zip.workspace = true
 [[test]]
 name = "samples"
 harness = false
+
+# `md-5` is imported by its library name, `md5`, which machete does not match to the package.
+[package.metadata.cargo-machete]
+ignored = ["md-5"]
 
 [features]
 default = ["codec-bzip2", "codec-zstd", "codec-brotli"]
