@@ -87,6 +87,9 @@ pub mod fuzzing {
     }
 }
 
+/// The most [`Archive::read`] reserves at once ahead of the bytes it has copied.
+const READ_RESERVE_STEP: usize = 64 << 20;
+
 /// Worker count assumed when the OS cannot report available parallelism.
 const WORKERS_FALLBACK: usize = 4;
 
@@ -295,9 +298,14 @@ impl<R: ReadAt + Size> Archive<R> {
         let size = reader.len();
         let limit = self.limits.max_file_len;
         ensure!(size <= limit, ctx::FileTooLarge { size, limit });
-        // Grown by what pages really return, not reserved from sizes the fsindex claims.
         let mut out = Vec::new();
         while let Some((page, range)) = reader.chunk()? {
+            // Reserved once a page has decoded, in bounded steps, so a size the fsindex
+            // merely claims cannot reserve memory no page backs.
+            if out.capacity() - out.len() < range.len() {
+                let rest = usize::try_from(size).unwrap_or(usize::MAX) - out.len();
+                out.reserve_exact(rest.min(READ_RESERVE_STEP).max(range.len()));
+            }
             out.extend_from_slice(&page[range.clone()]);
             reader.advance(range.len());
         }
@@ -383,7 +391,9 @@ impl<R: ReadAt + Size> Archive<R> {
     ///
     /// Reading in this order decodes each page about once. Path order can
     /// switch pages hundreds of times in a large archive, and pages past the
-    /// cache's budget then decode again on every return.
+    /// cache's budget then decode again on every return. An [`Archive`] over a
+    /// `Sync` source is `Sync`, so splitting this list into runs across threads
+    /// decodes pages in parallel, each page by one thread.
     #[must_use]
     pub fn page_order(&self) -> Vec<(String, NodeId)> {
         let mut files: Vec<(String, NodeId)> = self
