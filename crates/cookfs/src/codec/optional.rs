@@ -1,16 +1,41 @@
 //! Codecs behind a cargo feature, each with a stub that reports it unavailable when off.
 
-#[cfg(any(feature = "codec-zstd", feature = "codec-brotli"))]
-use snafu::ResultExt;
+#[cfg(any(
+    feature = "codec-bzip2",
+    feature = "codec-zstd",
+    feature = "codec-brotli"
+))]
+use std::io::Read;
 
 #[cfg(any(
     feature = "codec-bzip2",
     feature = "codec-zstd",
     feature = "codec-brotli"
 ))]
-use super::bounded;
+use snafu::{ResultExt, ensure};
+
 use super::{DecodeError, decode_error};
 use crate::wire::Compression;
+
+#[cfg(any(
+    feature = "codec-bzip2",
+    feature = "codec-zstd",
+    feature = "codec-brotli"
+))]
+/// Reads a decoder to its end, failing rather than truncating past `limit`.
+///
+/// `take(limit)` alone stops at the ceiling and reports the truncated output
+/// as clean, which lets an oversized stream through. Taking one byte more and
+/// refusing it turns the ceiling into an error.
+fn bounded(id: Compression, reader: impl Read, limit: usize) -> Result<Vec<u8>, DecodeError> {
+    let mut out = Vec::new();
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .context(decode_error::Decompress { id })?;
+    ensure!(out.len() <= limit, decode_error::TooLarge { id, limit });
+    Ok(out)
+}
 
 #[cfg(feature = "codec-bzip2")]
 pub(super) fn bzip2(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, DecodeError> {

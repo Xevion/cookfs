@@ -7,9 +7,7 @@ mod stream;
 #[cfg(test)]
 pub(crate) mod testing;
 
-use std::io::Read;
-
-use snafu::{ResultExt, ensure};
+use snafu::ensure;
 
 pub use error::DecodeError;
 pub(crate) use error::decode_error;
@@ -126,21 +124,6 @@ pub(crate) fn decode(id: Compression, body: &[u8], expect: Expect) -> Result<Vec
             }
         );
     }
-    Ok(out)
-}
-
-/// Reads a decoder to its end, failing rather than truncating past `limit`.
-///
-/// `take(limit)` alone stops at the ceiling and reports the truncated output
-/// as clean, which lets an oversized stream through. Taking one byte more and
-/// refusing it turns the ceiling into an error.
-fn bounded(id: Compression, reader: impl Read, limit: usize) -> Result<Vec<u8>, DecodeError> {
-    let mut out = Vec::new();
-    reader
-        .take((limit as u64).saturating_add(1))
-        .read_to_end(&mut out)
-        .context(decode_error::Decompress { id })?;
-    ensure!(out.len() <= limit, decode_error::TooLarge { id, limit });
     Ok(out)
 }
 
