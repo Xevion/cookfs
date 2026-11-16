@@ -172,7 +172,7 @@ const fn blob(at: u64, info: BlobInfo) -> BlobRef {
 /// u32 N, N x u8 compression, N x u8 level, N x u8 encrypted,
 /// N x u32 compressed size, N x u32 uncompressed size, N x 16-byte MD5
 /// ```
-fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, TrailerError> {
+pub(crate) fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, TrailerError> {
     let mut r = Reader::new(plain);
     let count = r
         .record::<U32>()

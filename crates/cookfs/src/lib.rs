@@ -35,6 +35,21 @@ pub use parsers::cfs0003::{Encryption, EncryptionMode};
 pub use source::SourceError;
 pub use wire::Compression;
 
+/// Entry points for the fuzz targets into parsers the public API does not expose.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    /// Parses `data` as a decoded fsindex.
+    pub fn fsindex(data: &[u8]) {
+        let _ = crate::index::Index::parse(data, 64);
+    }
+
+    /// Parses `data` as a decoded `CFS0003` pgindex.
+    pub fn pgindex(data: &[u8]) {
+        let _ = crate::parsers::cfs0003::page_table(data, u64::MAX);
+    }
+}
+
 /// Worker count assumed when the OS cannot report available parallelism.
 const WORKERS_FALLBACK: usize = 4;
 
@@ -312,6 +327,55 @@ mod tests {
         let archive = open(cfs0002::tests::archive(&[page], &stored(&fsindex))).unwrap();
         let (_, idx) = archive.walk().into_iter().next().unwrap();
         check!(let Err(Error::BlockOutOfPage { page: 0, page_len: 10, .. }) = archive.read(idx));
+    }
+
+    /// Opens `buf` and reads every file, discarding the outcome; only a panic fails.
+    fn exercise(buf: Vec<u8>) {
+        let opts = OpenOptions {
+            limits: Limits {
+                max_fsindex_len: 1 << 16,
+                max_page_len: 1 << 16,
+                max_depth: 16,
+            },
+        };
+        if let Ok(archive) = Archive::open(buf, &opts) {
+            for (_, idx) in archive.walk() {
+                let _ = archive.read(idx);
+            }
+        }
+    }
+
+    mod robustness {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn mutated(base: Vec<u8>) -> impl Strategy<Value = Vec<u8>> {
+            let len = base.len();
+            proptest::collection::vec((0..len, any::<u8>()), 1..8).prop_map(move |edits| {
+                let mut buf = base.clone();
+                for (at, byte) in edits {
+                    buf[at] = byte;
+                }
+                buf
+            })
+        }
+
+        proptest! {
+            #[test]
+            fn arbitrary_bytes_never_panic(buf in proptest::collection::vec(any::<u8>(), 0..512)) {
+                exercise(buf);
+            }
+
+            #[test]
+            fn a_corrupted_cfs0002_archive_never_panics(buf in mutated(one_file_v2(b"hello world!"))) {
+                exercise(buf);
+            }
+
+            #[test]
+            fn a_corrupted_cfs0003_archive_never_panics(buf in mutated(one_file_v3(b"hello v3!"))) {
+                exercise(buf);
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,36 @@
+[package]
+name = "cookfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+cookfs = { path = "../crates/cookfs" }
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fsindex"
+path = "fuzz_targets/fsindex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgindex"
+path = "fuzz_targets/pgindex.rs"
+test = false
+doc = false
+bench = false
+
+# A standalone root, per cargo-fuzz convention, so it never joins the main workspace.
+[workspace]

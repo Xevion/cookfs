@@ -1,0 +1,4 @@
+# cargo-fuzz needs nightly sanitizers; pinned so a run does not move under the tree.
+[toolchain]
+channel = "nightly-2026-11-09"
+profile = "minimal"

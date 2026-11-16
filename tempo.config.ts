@@ -83,6 +83,16 @@ export default defineConfig({
       requires: [{ tool: "cargo-llvm-cov" }],
     }),
 
+    // Runs from `fuzz/` so its pinned nightly applies. The cargo-fuzz build installed here
+    // targets musl by default, which that toolchain does not carry.
+    task({
+      name: "fuzz:run",
+      body: ["cargo", "fuzz", "run", "--target", "x86_64-unknown-linux-gnu"],
+      cwd: "fuzz",
+      passthrough: true,
+      requires: [{ tool: "cargo-fuzz", hint: "cargo install cargo-fuzz" }],
+    }),
+
     task({
       name: "corpus:cli",
       body: ["bun", "run", "tools/corpus.ts"],
@@ -106,6 +116,11 @@ export default defineConfig({
     fmt: { description: "Rewrite formatting in place", tags: ["format"], concurrency: 1 },
     coverage: { description: "Line coverage into coverage/", tasks: ["rust:coverage"] },
     audit: { description: "Scan dependencies for advisories", tasks: ["ci:advisories"] },
+    fuzz: {
+      description: "Run a fuzz target, e.g. `tempo fuzz -- archive -- -max_total_time=60`",
+      tasks: ["fuzz:run"],
+      passthrough: true,
+    },
     corpus: {
       description: "Manage the sample corpus (status, pull, push, add, verify, prune)",
       tasks: ["corpus:cli"],
