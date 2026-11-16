@@ -14,7 +14,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use common::{Sample, manifest, samples_dir, workspace_root};
+use common::{Sample, fixtures_dir, manifest, samples_dir, workspace_root};
 use cookfs::{Archive, Kind, OpenOptions};
 use libtest_mimic::{Arguments, Failed, Trial};
 use positioned_io::{ReadAt, Size};
@@ -219,9 +219,7 @@ const KNOWN_BUGS: &[(&str, &str)] = &[];
 
 /// Archives upstream wrote for cases the corpus lacks, each beside upstream's listing of it.
 fn fixtures() -> Vec<Trial> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures");
+    let dir = fixtures_dir();
     let mut names: Vec<PathBuf> = fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
         .filter_map(|entry| entry.ok().map(|e| e.path()))

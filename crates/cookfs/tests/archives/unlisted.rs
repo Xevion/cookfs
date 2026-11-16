@@ -1,16 +1,12 @@
 //! Archives upstream wrote that a listing cannot describe, each checked against what it holds.
 
-use std::path::Path;
-
 use assert2::check;
 use cookfs::{Archive, OpenOptions};
 
+use crate::common::fixtures_dir;
+
 fn open(name: &str) -> cookfs::Result<Archive<Vec<u8>>> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("unlisted")
-        .join(name);
+    let path = fixtures_dir().join("unlisted").join(name);
     let buf = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     Archive::open(buf, &OpenOptions::default())
 }

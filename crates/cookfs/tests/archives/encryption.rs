@@ -3,17 +3,14 @@
 //! Reading them with the right password is checked against upstream's listing
 //! with the other fixtures.
 
-use std::path::Path;
-
 use assert2::check;
 use cookfs::{Archive, DecodeError, EncryptionMode, Error, OpenOptions};
 use rstest::rstest;
 
+use crate::common::fixtures_dir;
+
 fn open(name: &str, opts: &OpenOptions) -> cookfs::Result<Archive<Vec<u8>>> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(format!("{name}.cfs"));
+    let path = fixtures_dir().join(format!("{name}.cfs"));
     let buf = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     Archive::open(buf, opts)
 }

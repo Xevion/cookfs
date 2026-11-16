@@ -3,12 +3,10 @@
 //! An absent corpus skips; one that is present but wrong fails. Collapsing those two would let a
 //! run that checked nothing report green.
 
-mod common;
-
 use std::fs;
 
+use crate::common::{manifest, samples_dir};
 use assert2::check;
-use common::{manifest, samples_dir};
 
 #[test]
 fn the_manifest_is_well_formed() {

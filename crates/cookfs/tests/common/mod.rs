@@ -1,4 +1,4 @@
-//! Shared helpers for reading `corpus.toml` and locating fetched samples.
+//! Shared helpers for reading `corpus.toml` and locating fetched samples and checked-in fixtures.
 
 use std::env;
 use std::fs;
@@ -22,6 +22,12 @@ pub(crate) fn workspace_root() -> PathBuf {
         .nth(2)
         .unwrap_or_else(|| panic!("crate manifest lives two levels under the workspace root"))
         .to_path_buf()
+}
+
+pub(crate) fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
 pub(crate) fn samples_dir() -> PathBuf {
