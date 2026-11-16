@@ -22,7 +22,13 @@ const TREES: Record<Flavor, { repo: string; rev: string; submodules: string[]; c
     repo: "https://github.com/greyltc/tcl-cookfs",
     rev: "f367cfe5f7e723369ef0d8ccc1898c0c30278b2e",
     submodules: [],
-    configure: ["--enable-bz2", "--enable-threads", "--enable-64bit"],
+    // The 2015 sources declare nothing before use and use K&R definitions; newer gcc rejects both.
+    configure: [
+      "--enable-bz2",
+      "--enable-threads",
+      "--enable-64bit",
+      "CC=cc -std=gnu99 -Wno-implicit-function-declaration",
+    ],
   },
   current: {
     repo: "https://github.com/chpock/cookfs",
