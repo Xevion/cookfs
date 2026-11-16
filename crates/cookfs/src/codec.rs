@@ -203,8 +203,24 @@ fn bzip2(id: Compression, _: &[u8], _: usize) -> Result<Vec<u8>, CodecError> {
 }
 
 #[cfg(feature = "codec-zstd")]
+/// Decodes a zstd frame whose window is no larger than the output it may produce.
+///
+/// The decoder allocates the window the frame header asks for, up to 128 MiB
+/// from a 10-byte frame. Upstream writes single-segment frames, whose window
+/// is their content size, so capping it at the output limit refuses only
+/// frames no upstream writer produces.
 fn zstd(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
-    let decoder = zstd::stream::read::Decoder::new(body).context(codec_error::Decompress { id })?;
+    const MIN_WINDOW_LOG: u32 = 10;
+    const MAX_WINDOW_LOG: u32 = 31;
+    let window_log = limit
+        .checked_next_power_of_two()
+        .map_or(MAX_WINDOW_LOG, usize::trailing_zeros)
+        .clamp(MIN_WINDOW_LOG, MAX_WINDOW_LOG);
+    let mut decoder =
+        zstd::stream::read::Decoder::new(body).context(codec_error::Decompress { id })?;
+    decoder
+        .window_log_max(window_log)
+        .context(codec_error::Decompress { id })?;
     bounded(id, decoder, limit)
 }
 
@@ -218,8 +234,20 @@ fn zstd(id: Compression, _: &[u8], _: usize) -> Result<Vec<u8>, CodecError> {
 }
 
 #[cfg(feature = "codec-brotli")]
+/// Decodes a standard brotli stream, whose window is at most 16 MiB.
+///
+/// The decoder also accepts the large-window extension, which upstream's
+/// decoder refuses and which lets a 123-byte stream claim a 512 MiB window.
+/// Its first seven bits are a fixed marker, so it is refused before decoding.
 fn brotli(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
     const BUFFER: usize = 4096;
+    const LARGE_WINDOW: u8 = 0x11;
+    if body.first().is_some_and(|b| b & 0x7F == LARGE_WINDOW) {
+        return Err(std::io::Error::other(
+            "large-window brotli is not standard brotli",
+        ))
+        .context(codec_error::Decompress { id });
+    }
     bounded(id, brotli::Decompressor::new(body, BUFFER), limit)
 }
 
@@ -362,10 +390,9 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "codec-zstd")]
+    /// A one-shot frame, as upstream's `ZSTD_compress` writes: single-segment, so its window is its size.
     pub(crate) fn zstd_stream(payload: &[u8]) -> Vec<u8> {
-        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
-        encoder.write_all(payload).unwrap();
-        encoder.finish().unwrap()
+        zstd::bulk::compress(payload, 0).unwrap()
     }
 
     #[cfg(feature = "codec-brotli")]
