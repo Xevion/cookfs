@@ -22,6 +22,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod blob;
 mod bytes;
 mod cache;
 mod codec;
@@ -31,7 +32,6 @@ mod file;
 mod index;
 mod limits;
 mod name;
-mod page;
 mod parsers;
 mod source;
 mod wire;
@@ -39,21 +39,21 @@ mod wire;
 use positioned_io::{ReadAt, Size};
 use snafu::{OptionExt, ResultExt, ensure};
 
+use blob::BlobRef;
 use cache::{Budget, Page, PageCache};
 use crypto::Key;
 use error::error as ctx;
 use index::Index;
-use page::BlobRef;
 use parsers::{cfs0002, cfs0003};
 
 pub use bytes::BytesError;
-pub use codec::CodecError;
+pub use codec::DecodeError;
+pub use crypto::{Encryption, EncryptionMode};
 pub use error::{Blob, Error, Result};
 pub use file::FileReader;
 pub use index::{Block, IndexError, Kind, Node, NodeId, Walk};
 pub use limits::Limits;
 pub use parsers::TrailerError;
-pub use parsers::cfs0003::{Encryption, EncryptionMode};
 pub use source::SourceError;
 pub use wire::Compression;
 
@@ -81,7 +81,7 @@ pub mod fuzzing {
         body: &[u8],
         declared: Option<usize>,
         limit: usize,
-    ) -> Result<Vec<u8>, crate::CodecError> {
+    ) -> Result<Vec<u8>, crate::DecodeError> {
         let expect = crate::codec::Expect { declared, limit };
         crate::codec::decode(crate::wire::Compression::from_raw(id), body, expect)
     }
@@ -531,7 +531,7 @@ fn assemble<R: ReadAt>(
 
 /// Everything one trailer candidate opens to.
 struct Assembled {
-    layout: page::Layout,
+    layout: parsers::Layout,
     version: ArchiveVersion,
     index: Index,
     key: Option<Key>,
@@ -839,7 +839,7 @@ mod tests {
 
         let archive = open(buf.clone()).unwrap();
         let (_, idx) = archive.walk().next().unwrap();
-        check!(let Err(Error::Decode { blob: Blob::Page(0), source: CodecError::HashMismatch { hash: "CRC-32" } }) = archive.read(idx));
+        check!(let Err(Error::Decode { blob: Blob::Page(0), source: DecodeError::HashMismatch { hash: "CRC-32" } }) = archive.read(idx));
 
         let lax = OpenOptions {
             verify: false,
@@ -1079,6 +1079,6 @@ mod tests {
             ..OpenOptions::default()
         };
         let check = Archive::open(one_file_v2(b"x"), &opts);
-        check!(let Err(Error::Decode { blob: Blob::Fsindex, source: CodecError::TooLarge { limit: 4, .. } }) = check);
+        check!(let Err(Error::Decode { blob: Blob::Fsindex, source: DecodeError::TooLarge { limit: 4, .. } }) = check);
     }
 }

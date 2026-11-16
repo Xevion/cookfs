@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use assert2::check;
-use cookfs::{Archive, CodecError, EncryptionMode, Error, OpenOptions};
+use cookfs::{Archive, DecodeError, EncryptionMode, Error, OpenOptions};
 use rstest::rstest;
 
 fn open(name: &str, opts: &OpenOptions) -> cookfs::Result<Archive<Vec<u8>>> {
@@ -51,6 +51,6 @@ fn a_wrong_file_mode_password_fails_every_encrypted_read() {
         .collect();
     check!(!failures.is_empty());
     for got in failures {
-        check!(let Err(Error::Decode { source: CodecError::Decrypt { .. } | CodecError::HashMismatch { .. }, .. }) = got);
+        check!(let Err(Error::Decode { source: DecodeError::Decrypt { .. } | DecodeError::HashMismatch { .. }, .. }) = got);
     }
 }

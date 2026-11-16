@@ -1,16 +1,29 @@
-//! Format-specific trailer parsers, each building a shared [`crate::page::Layout`].
+//! Format-specific trailer parsers, each building a shared [`Layout`].
 //!
 //! This is the only place a `CFS0002` versus `CFS0003` branch fires.
 //! Everything downstream reads the normalized layout.
 
 use snafu::Snafu;
 
+use crate::blob::BlobRef;
 use crate::bytes::BytesError;
-use crate::codec::CodecError;
+use crate::codec::DecodeError;
+use crate::crypto::Encryption;
 use crate::source::SourceError;
 
 pub(crate) mod cfs0002;
 pub(crate) mod cfs0003;
+
+/// Everything [`crate::Archive::open`] needs once a format parser has run.
+#[derive(Debug)]
+pub(crate) struct Layout {
+    /// Every data page, in page-index order.
+    pub(crate) pages: Vec<BlobRef>,
+    /// The fsindex blob.
+    pub(crate) fsindex: BlobRef,
+    /// The `CFS0003` encryption byte; `CFS0002` has none.
+    pub(crate) encryption: Option<Encryption>,
+}
 
 /// A trailer that does not describe a readable archive.
 #[derive(Debug, Snafu)]
@@ -51,7 +64,7 @@ pub enum TrailerError {
     #[snafu(display("pgindex could not be decoded"))]
     PgindexBlob {
         /// The decoder's failure.
-        source: CodecError,
+        source: DecodeError,
     },
     /// The decoded `CFS0003` pgindex is longer than its own page count allows.
     #[snafu(display("pgindex has {extra} bytes after its last record"))]

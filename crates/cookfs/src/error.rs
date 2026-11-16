@@ -4,10 +4,10 @@ use std::fmt;
 
 use snafu::Snafu;
 
-use crate::codec::CodecError;
+use crate::codec::DecodeError;
+use crate::crypto::EncryptionMode;
 use crate::index::IndexError;
 use crate::parsers::TrailerError;
-use crate::parsers::cfs0003::EncryptionMode;
 use crate::source::SourceError;
 
 /// Which blob a decode failure belongs to.
@@ -58,7 +58,7 @@ pub enum Error {
         /// Which blob.
         blob: Blob,
         /// The decoder's failure.
-        source: CodecError,
+        source: DecodeError,
     },
     /// The archive is encrypted and no password was given, or its encryption data is missing.
     #[snafu(display("archive is encrypted ({mode}) and needs a password"))]

@@ -1,4 +1,4 @@
-//! The page table every format-specific parser normalizes into.
+//! The blob reference every format-specific parser normalizes into.
 //!
 //! `CFS0002` names a blob's codec in the blob's own first byte, `CFS0003` in a
 //! separate table. Past [`crate::Archive::open`] nothing asks which format it
@@ -6,7 +6,7 @@
 
 use md5::{Digest, Md5};
 
-use crate::codec::{self, CodecError, Expect, codec_error};
+use crate::codec::{self, DecodeError, Expect, decode_error};
 use crate::crypto::Key;
 use crate::wire::Compression;
 
@@ -36,13 +36,13 @@ impl Hash {
     }
 
     /// Fails unless `data` hashes to what was stored.
-    pub(crate) fn check(self, data: &[u8]) -> Result<(), CodecError> {
+    pub(crate) fn check(self, data: &[u8]) -> Result<(), DecodeError> {
         let (hash, matches) = match self {
             Self::Unhashed => return Ok(()),
             Self::Md5(want) => ("MD5", <[u8; 16]>::from(Md5::digest(data)) == want),
             Self::Crc32(want) => ("CRC-32", crc32fast::hash(data) == want),
         };
-        snafu::ensure!(matches, codec_error::HashMismatch { hash });
+        snafu::ensure!(matches, decode_error::HashMismatch { hash });
         Ok(())
     }
 }
@@ -76,6 +76,26 @@ pub(crate) struct BlobRef {
 }
 
 impl BlobRef {
+    /// A reference whose hash and IV both come from its 16-byte hash `slot`; an all-zero slot is unhashed.
+    pub(crate) fn new(
+        at: u64,
+        len: u32,
+        codec: Codec,
+        declared: Option<u32>,
+        encrypted: bool,
+        slot: [u8; 16],
+    ) -> Self {
+        Self {
+            at,
+            len,
+            codec,
+            declared,
+            encrypted,
+            hash: Hash::from_slot(slot),
+            iv: slot,
+        }
+    }
+
     /// Decrypts the blob if it is encrypted, decodes it, then checks its hash unless `verify` is off.
     ///
     /// An encrypted blob needs `key`; callers refuse one without it first.
@@ -85,7 +105,7 @@ impl BlobRef {
         limit: usize,
         verify: bool,
         key: Option<&Key>,
-    ) -> Result<Vec<u8>, CodecError> {
+    ) -> Result<Vec<u8>, DecodeError> {
         let expect = Expect {
             declared: self.declared.map(|n| n as usize),
             limit,
@@ -109,17 +129,6 @@ impl BlobRef {
     }
 }
 
-/// Everything [`crate::Archive::open`] needs once a format parser has run.
-#[derive(Debug)]
-pub(crate) struct Layout {
-    /// Every data page, in page-index order.
-    pub(crate) pages: Vec<BlobRef>,
-    /// The fsindex blob.
-    pub(crate) fsindex: BlobRef,
-    /// The `CFS0003` encryption byte; `CFS0002` has none.
-    pub(crate) encryption: Option<crate::Encryption>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,7 +150,7 @@ mod tests {
         let crc = Hash::Crc32(crc32fast::hash(b"hello"));
         for hash in [md5, crc] {
             check!(hash.check(b"hello").is_ok());
-            check!(let Err(CodecError::HashMismatch { .. }) = hash.check(b"hellp"));
+            check!(let Err(DecodeError::HashMismatch { .. }) = hash.check(b"hellp"));
         }
         check!(Hash::Unhashed.check(b"anything").is_ok());
     }

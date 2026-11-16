@@ -38,7 +38,7 @@ pub(crate) fn at<R: ReadAt>(src: &R, offset: u64, len: usize) -> Result<Vec<u8>,
 }
 
 /// Signature hits a scan rejects before it stops looking.
-pub(crate) const MAX_CANDIDATES: usize = 4096;
+const MAX_CANDIDATES: usize = 4096;
 
 /// Scans backward for any of `signatures`, returning the rightmost hit `validate` accepts.
 ///

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use assert2::{assert, check};
 use proptest::prelude::*;
 
-use crate::codec::tests::{deflate, lzma_alone_stream, raw_lzma1_stream};
+use crate::codec::testing::{deflate, lzma_alone_stream, raw_lzma1_stream};
 use crate::index::MAGIC;
 use crate::index::tests::Fsindex;
 use crate::parsers::{cfs0002, cfs0003};
@@ -342,7 +342,7 @@ fn v2_base() -> Buf {
         let mut p = Buf::default();
         p.put("page 3 codec", Width::U8, 2);
         p.put("page 3 bzip2 size", Width::Be32, TEXT.len() as u64);
-        p.raw(&crate::codec::tests::bzip2_stream(TEXT));
+        p.raw(&crate::codec::testing::bzip2_stream(TEXT));
         pages.push((p, None, TEXT));
     }
 
@@ -423,7 +423,7 @@ fn v3_base() -> Buf {
     #[cfg(feature = "codec-zstd")]
     {
         let mut b = Buf::default();
-        b.raw(&crate::codec::tests::zstd_stream(TEXT));
+        b.raw(&crate::codec::testing::zstd_stream(TEXT));
         pages.push(Page3 {
             codec: 4,
             body: b,
@@ -433,7 +433,7 @@ fn v3_base() -> Buf {
     #[cfg(feature = "codec-brotli")]
     {
         let mut b = Buf::default();
-        b.raw(&crate::codec::tests::brotli_stream(TEXT));
+        b.raw(&crate::codec::testing::brotli_stream(TEXT));
         pages.push(Page3 {
             codec: 5,
             body: b,
@@ -1110,7 +1110,7 @@ fn a_raw_lzma1_header_that_is_short_or_invalid_is_an_error() {
 #[test]
 fn a_legacy_bzip2_size_prefix_that_lies_is_an_error() {
     use crate::codec::{Expect, decode_prefixed};
-    let stream = crate::codec::tests::bzip2_stream(TEXT);
+    let stream = crate::codec::testing::bzip2_stream(TEXT);
     let blob = |size: u32| {
         let mut b = vec![2u8];
         b.extend_from_slice(&size.to_be_bytes());

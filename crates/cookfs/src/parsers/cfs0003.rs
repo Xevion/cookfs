@@ -15,11 +15,11 @@ use snafu::ResultExt;
 use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use super::{TrailerError, addressable, before, trailer_error};
+use super::{Layout, TrailerError, addressable, before, trailer_error};
 use crate::Limits;
+use crate::blob::{BlobRef, Codec};
 use crate::bytes::Reader;
-use crate::crypto::Key;
-use crate::page::{BlobRef, Codec, Hash, Layout};
+use crate::crypto::{Encryption, EncryptionMode, Key};
 use crate::source;
 use crate::wire::Compression;
 
@@ -67,29 +67,6 @@ mod encryption_byte {
 }
 
 use encryption_byte::EncryptionByte;
-
-crate::wire::wire_enum! {
-    /// How a `CFS0003` archive is encrypted.
-    pub struct EncryptionMode(u8) {
-        /// Not encrypted.
-        NONE = 0,
-        /// Pages encrypted with a key derived from the password.
-        FILE = 1,
-        /// Pages encrypted with a random key, itself encrypted by the password.
-        KEY = 2,
-        /// As [`Self::KEY`], with the pgindex and fsindex encrypted too.
-        KEY_INDEX = 3,
-    }
-}
-
-/// A `CFS0003` archive's encryption mode and key-derivation level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Encryption {
-    /// The mode.
-    pub mode: EncryptionMode,
-    /// The PBKDF2 level, 0 to 31; upstream's default is 15.
-    pub level: u8,
-}
 
 impl From<u8> for Encryption {
     fn from(raw: u8) -> Self {
@@ -169,15 +146,14 @@ pub(crate) fn parse<R: ReadAt>(
 }
 
 fn blob(at: u64, info: BlobInfo, encrypted: bool) -> BlobRef {
-    BlobRef {
+    BlobRef::new(
         at,
-        len: info.size_compressed.get(),
-        codec: Codec::External(Compression::from_raw(info.compression)),
-        declared: Some(info.size_uncompressed.get()),
+        info.size_compressed.get(),
+        Codec::External(Compression::from_raw(info.compression)),
+        Some(info.size_uncompressed.get()),
         encrypted,
-        hash: Hash::from_slot(info.md5),
-        iv: info.md5,
-    }
+        info.md5,
+    )
 }
 
 /// Decodes the pgindex's struct-of-arrays into pages ending at `end`.
@@ -225,15 +201,14 @@ pub(crate) fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, Trailer
         .zip(uncompressed)
         .zip(hashes)
         .map(|((((&id, &flag), len), declared), &hash)| {
-            let page = BlobRef {
+            let page = BlobRef::new(
                 at,
-                len: len.get(),
-                codec: Codec::External(Compression::from_raw(id)),
-                declared: Some(declared.get()),
-                encrypted: flag != 0,
-                hash: Hash::from_slot(hash),
-                iv: hash,
-            };
+                len.get(),
+                Codec::External(Compression::from_raw(id)),
+                Some(declared.get()),
+                flag != 0,
+                hash,
+            );
             at += u64::from(len.get());
             page
         })

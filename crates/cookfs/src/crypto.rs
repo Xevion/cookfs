@@ -11,7 +11,30 @@ use aes::Aes256;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 use snafu::ensure;
 
-use crate::codec::{CodecError, codec_error};
+use crate::codec::{DecodeError, decode_error};
+
+crate::wire::wire_enum! {
+    /// How a `CFS0003` archive is encrypted.
+    pub struct EncryptionMode(u8) {
+        /// Not encrypted.
+        NONE = 0,
+        /// Pages encrypted with a key derived from the password.
+        FILE = 1,
+        /// Pages encrypted with a random key, itself encrypted by the password.
+        KEY = 2,
+        /// As [`Self::KEY`], with the pgindex and fsindex encrypted too.
+        KEY_INDEX = 3,
+    }
+}
+
+/// A `CFS0003` archive's encryption mode and key-derivation level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Encryption {
+    /// The mode.
+    pub mode: EncryptionMode,
+    /// The PBKDF2 level, 0 to 31; upstream's default is 15.
+    pub level: u8,
+}
 
 /// AES's block, and the length of every IV and salt here.
 pub(crate) const BLOCK: usize = 16;
@@ -57,16 +80,16 @@ impl Key {
     }
 
     /// Decrypts an encrypted blob and strips its padding.
-    pub(crate) fn decrypt(&self, iv: &[u8; BLOCK], blob: &[u8]) -> Result<Vec<u8>, CodecError> {
+    pub(crate) fn decrypt(&self, iv: &[u8; BLOCK], blob: &[u8]) -> Result<Vec<u8>, DecodeError> {
         ensure!(
             !blob.is_empty() && blob.len().is_multiple_of(BLOCK),
-            codec_error::Decrypt {
+            decode_error::Decrypt {
                 why: "it is not a whole number of AES blocks"
             }
         );
         let mut plain = blob.to_vec();
         self.cbc(iv, &mut plain);
-        let len = unpadded_len(&plain).ok_or(CodecError::Decrypt {
+        let len = unpadded_len(&plain).ok_or(DecodeError::Decrypt {
             why: "its padding is malformed, so the password is wrong or the blob corrupt",
         })?;
         plain.truncate(len);
@@ -123,9 +146,9 @@ mod tests {
     fn a_wrong_key_fails_on_its_padding_or_its_length() {
         let blob = encrypt(&[7; KEY_LEN], &[3; BLOCK], b"some page bytes");
         let wrong = Key([8; KEY_LEN]);
-        check!(let Err(CodecError::Decrypt { .. }) = wrong.decrypt(&[3; BLOCK], &blob));
-        check!(let Err(CodecError::Decrypt { .. }) = wrong.decrypt(&[3; BLOCK], &blob[..15]));
-        check!(let Err(CodecError::Decrypt { .. }) = wrong.decrypt(&[3; BLOCK], &[]));
+        check!(let Err(DecodeError::Decrypt { .. }) = wrong.decrypt(&[3; BLOCK], &blob));
+        check!(let Err(DecodeError::Decrypt { .. }) = wrong.decrypt(&[3; BLOCK], &blob[..15]));
+        check!(let Err(DecodeError::Decrypt { .. }) = wrong.decrypt(&[3; BLOCK], &[]));
     }
 
     #[test]

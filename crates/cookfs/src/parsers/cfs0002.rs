@@ -16,8 +16,9 @@ use snafu::ResultExt;
 use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use super::{TrailerError, addressable, before, trailer_error};
-use crate::page::{BlobRef, Codec, Hash, Layout};
+use super::{Layout, TrailerError, addressable, before, trailer_error};
+use crate::blob::{BlobRef, Codec};
+use crate::codec::LEGACY_CODECS;
 use crate::source;
 use crate::wire::Compression;
 
@@ -78,14 +79,6 @@ pub(crate) fn plausible<R: ReadAt>(src: &R, sig_at: u64) -> bool {
         && LEGACY_CODECS.contains(&Compression::from_raw(id[0]))
 }
 
-/// The codecs a `CFS0002` blob can name; the legacy writer knows no others.
-pub(crate) const LEGACY_CODECS: [Compression; 4] = [
-    Compression::NONE,
-    Compression::ZLIB,
-    Compression::BZIP2,
-    Compression::LEGACY_CUSTOM,
-];
-
 /// Parses the trailer behind a `CFS0002` signature at `sig_at`.
 pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerError> {
     let head_at = before("trailer head", sig_at, size_of::<Head>() as u64)?;
@@ -112,15 +105,14 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
         .iter()
         .zip(slots)
         .map(|(size, slot)| {
-            let page = BlobRef {
+            let page = BlobRef::new(
                 at,
-                len: size.get(),
-                codec: Codec::Prefixed,
-                declared: slot.declared_len(),
-                encrypted: false,
-                hash: Hash::from_slot(slot.0),
-                iv: slot.0,
-            };
+                size.get(),
+                Codec::Prefixed,
+                slot.declared_len(),
+                false,
+                slot.0,
+            );
             at += u64::from(size.get());
             page
         })
@@ -128,15 +120,14 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
 
     Ok(Layout {
         pages,
-        fsindex: BlobRef {
-            at: fsindex_at,
-            len: fsindex_len,
-            codec: Codec::Prefixed,
-            declared: None,
-            encrypted: false,
-            hash: Hash::Unhashed,
-            iv: [0; 16],
-        },
+        fsindex: BlobRef::new(
+            fsindex_at,
+            fsindex_len,
+            Codec::Prefixed,
+            None,
+            false,
+            [0; 16],
+        ),
         encryption: None,
     })
 }
