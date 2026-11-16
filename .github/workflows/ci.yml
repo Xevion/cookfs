@@ -33,6 +33,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Lint docs
         run: cargo doc --workspace --all-features --no-deps
+      - name: Check licences, bans and sources
+        run: cargo deny check licenses bans sources
+      - name: Check for unused dependencies
+        run: cargo machete
 
   test:
     name: test (${{ matrix.platform }})

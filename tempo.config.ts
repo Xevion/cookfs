@@ -26,6 +26,21 @@ export default defineConfig({
       tags: ["check"],
     }),
 
+    // Advisories are excluded: they live in `ci:advisories`, judged against the merge base.
+    task({
+      name: "rust:deny",
+      body: "cargo deny check licenses bans sources",
+      tags: ["check"],
+      requires: [{ tool: "cargo-deny" }],
+    }),
+
+    task({
+      name: "rust:machete",
+      body: "cargo machete",
+      tags: ["check"],
+      requires: [{ tool: "cargo-machete" }],
+    }),
+
     // Out of `check`: advisories move without the tree moving, so CI runs them on a schedule.
     task({
       name: "ci:advisories",
@@ -84,7 +99,10 @@ export default defineConfig({
   ],
 
   commands: {
-    check: { description: "Format, lint, docs, tests, advisories, workflows", tags: ["check"] },
+    check: {
+      description: "Format, lint, docs, tests, licences, unused deps, workflows",
+      tags: ["check"],
+    },
     fmt: { description: "Rewrite formatting in place", tags: ["format"], concurrency: 1 },
     coverage: { description: "Line coverage into coverage/", tasks: ["rust:coverage"] },
     audit: { description: "Scan dependencies for advisories", tasks: ["ci:advisories"] },
