@@ -9,7 +9,7 @@ use crate::codec::Codec;
 
 /// How to decode one blob: a page, or the fsindex itself.
 #[derive(Debug, Clone, Copy)]
-pub enum PageCodec {
+pub(crate) enum PageCodec {
     /// The blob's own leading byte names its codec (`CFS0002`).
     Prefixed,
     /// The codec is already known; the blob carries no leading byte (`CFS0003`).
@@ -18,7 +18,7 @@ pub enum PageCodec {
 
 /// One page's location, size, and how to decode it.
 #[derive(Debug, Clone, Copy)]
-pub struct PageEntry {
+pub(crate) struct PageEntry {
     /// Byte offset of the page's compressed data in the source.
     pub offset: u64,
     /// Compressed length in bytes.
@@ -31,7 +31,7 @@ pub struct PageEntry {
 
 /// Every page an archive holds, in page-index order.
 #[derive(Debug, Default)]
-pub struct PageTable {
+pub(crate) struct PageTable {
     /// One entry per page, indexed by page number.
     pub entries: Vec<PageEntry>,
 }
@@ -42,7 +42,7 @@ pub struct PageTable {
 /// `parsers` builds one of these from its own trailer shape, and every read
 /// path afterward is version-blind.
 #[derive(Debug)]
-pub struct Layout {
+pub(crate) struct Layout {
     /// The page table.
     pub pages: PageTable,
     /// Byte offset of the compressed fsindex blob.

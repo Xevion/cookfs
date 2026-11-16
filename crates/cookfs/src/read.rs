@@ -12,12 +12,12 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 /// The magic bytes that open a decompressed fsindex blob, identical across
 /// every format this crate reads.
-pub const FSINDEX_MAGIC: &[u8] = b"CFS2.200";
+pub(crate) const FSINDEX_MAGIC: &[u8] = b"CFS2.200";
 
 /// Cap for `Vec::with_capacity` from untrusted count fields; the vector still
 /// grows past this bound, but a crafted count cannot force a huge pre-alloc
 /// before the source runs out of bytes.
-pub const MAX_PREALLOC: usize = 1024;
+pub(crate) const MAX_PREALLOC: usize = 1024;
 
 /// Everything that can go wrong reading a cookfs archive.
 #[derive(Debug, Snafu)]
@@ -130,7 +130,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the source does not have `len` bytes at `offset`.
-pub fn at<R: ReadAt>(src: &R, offset: u64, len: usize) -> Result<Vec<u8>> {
+pub(crate) fn at<R: ReadAt>(src: &R, offset: u64, len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     src.read_exact_at(offset, &mut buf)
         .context(IoSnafu { offset })?;
@@ -141,7 +141,7 @@ pub fn at<R: ReadAt>(src: &R, offset: u64, len: usize) -> Result<Vec<u8>> {
 ///
 /// Panics on out-of-bounds access. Callers must pre-validate that `b` holds at
 /// least four bytes at `at`; use [`Cursor::be32`] for untrusted input.
-pub fn be32(b: &[u8], at: usize) -> u32 {
+pub(crate) fn be32(b: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(b[at..at + 4].try_into().unwrap_or_else(|_| unreachable!()))
 }
 
@@ -160,7 +160,7 @@ pub fn be32(b: &[u8], at: usize) -> u32 {
 /// # Errors
 ///
 /// Returns [`Error::NoSignature`] if no candidate validates.
-pub fn find_signature<R: ReadAt>(
+pub(crate) fn find_signature<R: ReadAt>(
     src: &R,
     len: u64,
     signatures: &[&[u8]],
@@ -200,20 +200,20 @@ pub fn find_signature<R: ReadAt>(
 /// the CFS0003 pgindex table, can be truncated by a corrupt or crafted
 /// archive. A cursor turns an out-of-bounds read into [`Error::Truncated`]
 /// instead of a panic.
-pub struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     blob: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
     /// Starts a cursor at the front of `blob`.
-    pub fn new(blob: &'a [u8]) -> Self {
+    pub(crate) fn new(blob: &'a [u8]) -> Self {
         Self { blob, pos: 0 }
     }
 
     /// The cursor's current byte offset into the blob.
     #[must_use]
-    pub fn pos(&self) -> usize {
+    pub(crate) fn pos(&self) -> usize {
         self.pos
     }
 
@@ -222,7 +222,7 @@ impl<'a> Cursor<'a> {
     /// # Errors
     ///
     /// Returns [`Error::Truncated`] if fewer than `len` bytes remain.
-    pub fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
         let end = self.pos.checked_add(len).context(TruncatedSnafu {
             pos: self.pos,
             need: len,
@@ -242,7 +242,7 @@ impl<'a> Cursor<'a> {
     /// # Errors
     ///
     /// Returns [`Error::Truncated`] if no bytes remain.
-    pub fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
 
@@ -251,7 +251,7 @@ impl<'a> Cursor<'a> {
     /// # Errors
     ///
     /// Returns [`Error::Truncated`] if fewer than 4 bytes remain.
-    pub fn be32(&mut self) -> Result<u32> {
+    pub(crate) fn be32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(
             self.take(4)?.try_into().unwrap_or_else(|_| unreachable!()),
         ))
@@ -262,7 +262,7 @@ impl<'a> Cursor<'a> {
     /// # Errors
     ///
     /// Returns [`Error::Truncated`] if fewer than 4 bytes remain.
-    pub fn be32i(&mut self) -> Result<i32> {
+    pub(crate) fn be32i(&mut self) -> Result<i32> {
         Ok(i32::from_be_bytes(
             self.take(4)?.try_into().unwrap_or_else(|_| unreachable!()),
         ))
@@ -273,7 +273,7 @@ impl<'a> Cursor<'a> {
     /// # Errors
     ///
     /// Returns [`Error::Truncated`] if fewer than 8 bytes remain.
-    pub fn be64i(&mut self) -> Result<i64> {
+    pub(crate) fn be64i(&mut self) -> Result<i64> {
         Ok(i64::from_be_bytes(
             self.take(8)?.try_into().unwrap_or_else(|_| unreachable!()),
         ))

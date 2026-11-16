@@ -5,10 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Overrides where samples live; the corpus tool reads the same variable.
-pub const DIR_ENV: &str = "COOKFS_CORPUS_DIR";
+pub(crate) const DIR_ENV: &str = "COOKFS_CORPUS_DIR";
 
 #[derive(Debug)]
-pub struct Sample {
+pub(crate) struct Sample {
     pub name: String,
     pub sha256: String,
     pub size: u64,
@@ -16,19 +16,19 @@ pub struct Sample {
     pub container: String,
 }
 
-pub fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
-        .expect("crate manifest lives two levels under the workspace root")
+        .unwrap_or_else(|| panic!("crate manifest lives two levels under the workspace root"))
         .to_path_buf()
 }
 
-pub fn samples_dir() -> PathBuf {
+pub(crate) fn samples_dir() -> PathBuf {
     env::var(DIR_ENV).map_or_else(|_| workspace_root().join("samples"), PathBuf::from)
 }
 
-pub fn manifest() -> Vec<Sample> {
+pub(crate) fn manifest() -> Vec<Sample> {
     let path = workspace_root().join("corpus.toml");
     let text =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));

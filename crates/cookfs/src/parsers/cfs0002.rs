@@ -12,7 +12,7 @@ use crate::page::{Layout, PageCodec, PageEntry, PageTable};
 use crate::read::{BadPageTableSnafu, MAX_PREALLOC, Result, at, be32};
 
 /// The seven bytes that mark the end of a `CFS0002` trailer.
-pub const SIGNATURE: &[u8] = b"CFS0002";
+pub(crate) const SIGNATURE: &[u8] = b"CFS0002";
 
 /// Parses the trailer and page table behind a `CFS0002` signature at `sig_at`.
 ///
@@ -21,7 +21,7 @@ pub const SIGNATURE: &[u8] = b"CFS0002";
 /// Returns [`crate::Error::BadPageTable`] if any length-prefixed field would
 /// place a region before offset 0, or [`crate::Error::Io`] if a read runs
 /// past the source's bounds.
-pub fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout> {
+pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout> {
     let head_at = sig_at.checked_sub(9).context(BadPageTableSnafu)?;
     let head = at(src, head_at, 9)?;
     let fsindex_len = be32(&head, 0) as usize;

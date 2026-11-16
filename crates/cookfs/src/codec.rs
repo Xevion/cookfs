@@ -109,7 +109,7 @@ impl Codec {
 /// [`crate::Error::UnknownCodec`] for an id outside the known set,
 /// [`crate::Error::CodecUnavailable`] for a known id this build cannot decode,
 /// and [`crate::Error::Decompress`] if a codec's decoder rejects the payload.
-pub fn decode(blob: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+pub(crate) fn decode(blob: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
     let (&id, body) = blob.split_first().context(EmptyBlobSnafu)?;
     decode_with(Codec::from_id(id)?, body, uncompressed_len)
 }
@@ -128,7 +128,7 @@ pub fn decode(blob: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
 /// Returns [`crate::Error::CodecUnavailable`] for a known id this build
 /// cannot decode, and [`crate::Error::Decompress`] if the codec's decoder
 /// rejects the payload.
-pub fn decode_with(codec: Codec, body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+pub(crate) fn decode_with(codec: Codec, body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
     match codec {
         Codec::Stored => Ok(body.to_vec()),
         Codec::Deflate => decode_deflate(body, uncompressed_len),

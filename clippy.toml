@@ -1,0 +1,17 @@
+msrv = "1.98"
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# Errors box their large sources, so every `Result` stays a few words wide.
+large-error-threshold = 64
+
+disallowed-macros = [
+    { path = "std::assert_eq", reason = "use assert2::check! or assert2::assert!" },
+    { path = "std::assert_ne", reason = "use assert2::check! or assert2::assert!" },
+]
+
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "poisoning adds nothing here; use parking_lot::Mutex" },
+    { path = "std::sync::RwLock", reason = "poisoning adds nothing here; use parking_lot::RwLock" },
+    { path = "std::collections::HashMap", reason = "randomly seeded, iteration order varies per run; use rustc_hash" },
+    { path = "std::collections::HashSet", reason = "randomly seeded, iteration order varies per run; use rustc_hash" },
+]

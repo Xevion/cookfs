@@ -17,7 +17,7 @@ use crate::page::{Layout, PageCodec, PageEntry, PageTable};
 use crate::read::{BadPageTableSnafu, Cursor, MAX_PREALLOC, Result, at};
 
 /// The seven bytes that mark the end of a `CFS0003` trailer.
-pub const SIGNATURE: &[u8] = b"CFS0003";
+pub(crate) const SIGNATURE: &[u8] = b"CFS0003";
 
 /// Bytes of fixed trailer fields preceding the signature (55 + 7 = 62 total).
 const TRAILER_LEN: u64 = 55;
@@ -25,7 +25,7 @@ const TRAILER_LEN: u64 = 55;
 /// The fixed fields behind a `CFS0003` signature, before the pgindex and
 /// fsindex blobs are read.
 #[derive(Debug)]
-pub struct Trailer {
+pub(crate) struct Trailer {
     /// Archive-wide compression id. Not currently used; every page and the
     /// fsindex name their own codec.
     #[cfg_attr(
@@ -106,7 +106,7 @@ impl Trailer {
     /// Returns [`crate::Error::BadPageTable`] if `sig_at` is too close to the
     /// start of the source to hold a full trailer, or [`crate::Error::Io`] if
     /// a read runs past the source's bounds.
-    pub fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Self> {
+    pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Self> {
         let trailer_at = sig_at.checked_sub(TRAILER_LEN).context(BadPageTableSnafu)?;
         let buf = at(src, trailer_at, TRAILER_LEN as usize)?;
         let mut c = Cursor::new(&buf);
@@ -131,7 +131,7 @@ impl Trailer {
 
 /// Per-page codec ids and sizes decoded from a `CFS0003` pgindex blob.
 #[derive(Debug)]
-pub struct PgIndex {
+pub(crate) struct PgIndex {
     /// Per-page compression id, in page order.
     pub compr: Vec<u8>,
     /// Per-page compressed length, in page order.
@@ -147,7 +147,7 @@ impl PgIndex {
     ///
     /// Returns [`crate::Error::Truncated`] if the blob is shorter than its
     /// own declared page count requires.
-    pub fn parse(blob: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(blob: &[u8]) -> Result<Self> {
         let mut c = Cursor::new(blob);
         let page_count = c.be32()? as usize;
 
@@ -185,7 +185,7 @@ impl PgIndex {
 /// place a region before offset 0, [`crate::Error::UnknownCodec`] if a page
 /// or the pgindex itself names an unrecognised codec id, and any error the
 /// pgindex codec's decoder can produce.
-pub fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout> {
+pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout> {
     let trailer = Trailer::parse(src, sig_at)?;
     let trailer_at = sig_at.checked_sub(TRAILER_LEN).context(BadPageTableSnafu)?;
 

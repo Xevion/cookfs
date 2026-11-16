@@ -4,5 +4,5 @@
 //! Everything downstream of `Archive::open` reads the normalized [`crate::page::Layout`]
 //! and never asks which format produced it.
 
-pub mod cfs0002;
-pub mod cfs0003;
+pub(crate) mod cfs0002;
+pub(crate) mod cfs0003;

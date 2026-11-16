@@ -62,7 +62,7 @@ impl Node {
 
 /// The parsed directory tree of one archive.
 #[derive(Debug)]
-pub struct Index {
+pub(crate) struct Index {
     /// Arena holding every node keyed by its [`Idx`].
     pub nodes: Arena<Node>,
     /// Handle of the archive's implicit root directory.
@@ -78,7 +78,7 @@ impl Index {
     /// expected magic, [`crate::Error::Truncated`] if a truncated or crafted
     /// blob runs out of bytes mid-record, or [`crate::Error::Desync`] if the
     /// parser does not consume exactly the bytes it was given.
-    pub fn parse(blob: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(blob: &[u8]) -> Result<Self> {
         ensure!(
             blob.starts_with(FSINDEX_MAGIC),
             BadMagicSnafu {
@@ -119,7 +119,7 @@ impl Index {
     }
 
     /// Walks the tree depth-first, yielding each node with its full path.
-    pub fn walk(&self) -> Vec<(String, Idx<Node>)> {
+    pub(crate) fn walk(&self) -> Vec<(String, Idx<Node>)> {
         let mut out = Vec::new();
         self.walk_into(self.root, "", &mut out);
         out

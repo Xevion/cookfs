@@ -5,9 +5,10 @@
 //! installers rather than from first principles.
 
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use lru::LruCache;
+use parking_lot::Mutex;
 
 /// A decompressed page, shared by every reader that asked for it.
 pub type Page = Arc<[u8]>;
@@ -69,14 +70,10 @@ pub struct PageCache {
 }
 
 impl PageCache {
-    /// Builds a cache holding at most `budget.pages` decompressed pages.
-    ///
-    /// # Panics
-    ///
-    /// Never: the capacity is clamped above zero before construction.
+    /// Builds a cache holding at most `budget.pages` decompressed pages, and never fewer than two.
     #[must_use]
     pub fn new(budget: Budget) -> Self {
-        let cap = NonZeroUsize::new(budget.pages.max(2)).expect("clamped above zero");
+        let cap = NonZeroUsize::new(budget.pages.max(2)).unwrap_or(NonZeroUsize::MIN);
         Self {
             slots: Mutex::new(LruCache::new(cap)),
         }
@@ -100,13 +97,10 @@ impl PageCache {
         let slot = self
             .slots
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_or_insert(n, || Arc::new(Mutex::new(None)))
             .clone();
 
-        let mut guard = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = slot.lock();
         if let Some(hit) = guard.as_ref() {
             return Ok(hit.clone());
         }
