@@ -83,3 +83,84 @@ pub(super) fn brotli(id: Compression, _: &[u8], _: usize) -> Result<Vec<u8>, Dec
     }
     .fail()
 }
+
+#[cfg(test)]
+mod tests {
+    /// The process's peak virtual size, which moves for C allocations the counting allocator cannot see.
+    #[cfg(all(target_os = "linux", feature = "codec-zstd"))]
+    fn vm_peak() -> usize {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("VmPeak:")).unwrap();
+        let kib: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        kib << 10
+    }
+
+    /// Found by the `codec_zstd` fuzz target: a 10-byte frame declaring a 128 MiB window and no content size.
+    #[cfg(all(target_os = "linux", feature = "codec-zstd"))]
+    #[test]
+    fn a_zstd_window_cannot_reserve_past_the_output_limit() {
+        use assert2::check;
+
+        use crate::codec::{Expect, decode};
+        use crate::tests::kit::MIB;
+        use crate::wire::Compression;
+        let frame = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x88, 0x09, 0x00, 0x00, b'A'];
+        let expect = Expect {
+            declared: None,
+            limit: 64 << 10,
+        };
+        let before = vm_peak();
+        // Upstream never writes a window past its content, so refusing the frame is as good as decoding it.
+        let got = decode(Compression::ZSTD, &frame, expect);
+        check!(got.as_deref().map_or(true, |out| out == b"A"));
+        let grew = vm_peak().saturating_sub(before);
+        check!(
+            grew < 16 * MIB,
+            "decoding one byte under a 64 KiB limit grew the process by {grew} bytes"
+        );
+    }
+
+    /// Two brotli streams whose windows dwarf what they decode to.
+    ///
+    /// The first has the largest standard window, its data split over two
+    /// metablocks so the decoder cannot size down. The second, found by the
+    /// `codec_brotli` fuzz target, opens with the large-window signature `0x11`.
+    #[cfg(feature = "codec-brotli")]
+    #[test]
+    fn a_brotli_window_stays_within_the_standard_maximum() {
+        use std::io::Write;
+
+        use assert2::check;
+
+        use crate::codec::{Expect, decode};
+        use crate::tests::alloc::peak;
+        use crate::tests::kit::MIB;
+        use crate::wire::Compression;
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 1, 24);
+        encoder.write_all(b"first metablock").unwrap();
+        encoder.flush().unwrap();
+        encoder.write_all(b", then a second").unwrap();
+        let standard = encoder.into_inner();
+        let large: Vec<u8> = std::iter::once(0x11)
+            .chain(std::iter::repeat_n(0x1D, 122))
+            .collect();
+        let over: Vec<String> = [(standard, None), (large, Some(53_098))]
+            .into_iter()
+            .filter_map(|(stream, declared)| {
+                let expect = Expect {
+                    declared,
+                    limit: 64 << 10,
+                };
+                let (_, held) = peak(|| decode(Compression::BROTLI, &stream, expect));
+                // 16 MiB is the largest window standard brotli can name.
+                (held > 17 * MIB).then(|| {
+                    format!(
+                        "a {}-byte stream under a 64 KiB limit held {held} bytes",
+                        stream.len()
+                    )
+                })
+            })
+            .collect();
+        check!(over.is_empty(), "{}", over.join("\n"));
+    }
+}

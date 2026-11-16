@@ -108,35 +108,21 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assert2::check;
-    use zerocopy::byteorder::big_endian::U32;
+    use assert2::{assert, check};
+    use rstest::rstest;
 
-    #[test]
-    fn a_count_larger_than_the_blob_fails_before_any_allocation() {
+    /// A count whose byte size overflows saturates rather than wrapping.
+    #[rstest]
+    #[case::larger_than_the_blob(4, 4, 16)]
+    #[case::byte_size_overflows(u32::MAX, usize::MAX, usize::MAX)]
+    fn a_count_the_blob_cannot_hold_fails_before_any_allocation(
+        #[case] count: u32,
+        #[case] size: usize,
+        #[case] want: usize,
+    ) {
         let blob = [0u8; 8];
         let r = Reader::new(&blob);
-        check!(let Err(BytesError::Overrun { want: 16, .. }) = r.check_count(4, 4));
-    }
-
-    #[test]
-    fn a_count_whose_byte_size_overflows_saturates() {
-        let blob = [0u8; 8];
-        let r = Reader::new(&blob);
-        check!(let Err(BytesError::Overrun { want: usize::MAX, .. }) = r.check_count(u32::MAX, usize::MAX));
-    }
-
-    #[test]
-    fn records_cast_big_endian_values_in_place() {
-        let mut blob = 7u32.to_be_bytes().to_vec();
-        blob.extend_from_slice(&9u32.to_be_bytes());
-        let mut r = Reader::new(&blob);
-        let values: Vec<u32> = r
-            .records::<U32>(2)
-            .unwrap()
-            .iter()
-            .map(|v| v.get())
-            .collect();
-        check!(values == [7, 9]);
-        check!(r.remaining() == 0);
+        assert!(let Err(BytesError::Overrun { want: got, .. }) = r.check_count(count, size));
+        check!(got == want);
     }
 }

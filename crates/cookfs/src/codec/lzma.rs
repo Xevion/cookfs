@@ -109,8 +109,9 @@ pub(super) fn raw_lzma1(
 
 #[cfg(test)]
 mod tests {
-    use super::super::decode;
     use super::super::testing::{TEXT, exact, lzma_alone_stream, raw_lzma1_stream};
+    use super::super::{Expect, decode};
+    use crate::tests::kit::MIB;
     use crate::wire::Compression;
     use assert2::check;
 
@@ -133,5 +134,29 @@ mod tests {
         let mut body = raw_lzma1_stream(TEXT);
         body[1..5].copy_from_slice(&0xFFFF_FFBFu32.to_le_bytes());
         check!(decode(Compression::LZMA, &body, exact(TEXT.len())).unwrap() == TEXT);
+    }
+
+    /// Raw LZMA1 headers at every length short of whole, and property bytes past what LZMA allows.
+    #[test]
+    fn a_raw_lzma1_header_that_is_short_or_invalid_is_an_error() {
+        let exact = |len| Expect {
+            declared: Some(len),
+            limit: MIB,
+        };
+        let stream = raw_lzma1_stream(TEXT);
+        for len in 0..5 {
+            check!(
+                decode(Compression::LZMA, &stream[..len], exact(TEXT.len())).is_err(),
+                "{len}-byte header"
+            );
+        }
+        for props in [225u8, 0xFF] {
+            let mut body = stream.clone();
+            body[0] = props;
+            check!(
+                decode(Compression::LZMA, &body, exact(TEXT.len())).is_err(),
+                "properties {props:#x}"
+            );
+        }
     }
 }

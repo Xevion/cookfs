@@ -154,6 +154,8 @@ mod tests {
     use super::testing::zstd_stream;
     use super::testing::{TEXT, deflate, exact, lzma_alone_stream, raw_lzma1_stream};
     use super::*;
+    #[cfg(feature = "codec-bzip2")]
+    use crate::tests::kit::MIB;
     use assert2::check;
     use rstest::rstest;
 
@@ -188,56 +190,52 @@ mod tests {
         check!(decode_prefixed(&blob, exact(TEXT.len())).unwrap() == TEXT);
     }
 
-    #[cfg(feature = "codec-bzip2")]
-    #[test]
-    fn a_legacy_bzip2_blob_carries_its_size_before_the_stream() {
-        let mut blob = vec![2u8];
-        blob.extend_from_slice(&(TEXT.len() as u32).to_be_bytes());
-        blob.extend_from_slice(&bzip2_stream(TEXT));
-        let expect = Expect {
-            declared: None,
-            limit: 1 << 20,
-        };
-        check!(decode_prefixed(&blob, expect).unwrap() == TEXT);
+    /// The failures a size check can report, without the codec or the io error behind them.
+    #[derive(Debug, PartialEq)]
+    enum Refusal {
+        Unbounded,
+        TooLarge { limit: usize },
+        Short { want: usize, got: usize },
     }
 
-    #[test]
-    fn raw_lzma1_without_a_declared_size_is_refused() {
-        let body = raw_lzma1_stream(TEXT);
-        let expect = Expect {
-            declared: None,
-            limit: 1 << 20,
-        };
-        check!(let Err(DecodeError::Unbounded { .. }) = decode(Compression::LZMA, &body, expect));
+    fn refusal(err: DecodeError) -> Refusal {
+        match err {
+            DecodeError::Unbounded { .. } => Refusal::Unbounded,
+            DecodeError::TooLarge { limit, .. } => Refusal::TooLarge { limit },
+            DecodeError::Short { want, got, .. } => Refusal::Short { want, got },
+            other => panic!("not a size refusal: {other:?}"),
+        }
     }
 
-    #[test]
-    fn output_past_the_limit_is_an_error_not_a_truncation() {
-        let expect = Expect {
-            declared: None,
-            limit: 4,
-        };
-        check!(let Err(DecodeError::TooLarge { limit: 4, .. }) = decode(Compression::ZLIB, &deflate(TEXT), expect));
-    }
-
-    #[test]
-    fn output_past_its_declared_size_is_an_error() {
-        check!(let Err(DecodeError::TooLarge { limit: 4, .. }) = decode(Compression::ZLIB, &deflate(TEXT), exact(4)));
-    }
-
-    #[test]
-    fn output_short_of_its_declared_size_is_an_error() {
-        let got = decode(Compression::ZLIB, &deflate(TEXT), exact(TEXT.len() + 1));
-        check!(let Err(DecodeError::Short { got: 43, want: 44, .. }) = got);
-    }
-
-    #[test]
-    fn a_declared_size_above_the_limit_is_refused_before_decoding() {
-        let expect = Expect {
-            declared: Some(100),
-            limit: 10,
-        };
-        check!(let Err(DecodeError::TooLarge { limit: 10, .. }) = decode(Compression::NONE, &[0; 100], expect));
+    #[rstest]
+    #[case::raw_lzma1_without_a_declared_size(
+        Compression::LZMA, raw_lzma1_stream(TEXT), None, 1 << 20, Refusal::Unbounded
+    )]
+    #[case::output_past_the_limit_is_not_truncated(
+        Compression::ZLIB, deflate(TEXT), None, 4, Refusal::TooLarge { limit: 4 }
+    )]
+    #[case::output_past_its_declared_size(
+        Compression::ZLIB, deflate(TEXT), Some(4), usize::MAX, Refusal::TooLarge { limit: 4 }
+    )]
+    #[case::output_short_of_its_declared_size(
+        Compression::ZLIB,
+        deflate(TEXT),
+        Some(TEXT.len() + 1),
+        usize::MAX,
+        Refusal::Short { want: TEXT.len() + 1, got: TEXT.len() }
+    )]
+    #[case::declared_size_above_the_limit_before_decoding(
+        Compression::NONE, TEXT.to_vec(), Some(100), 10, Refusal::TooLarge { limit: 10 }
+    )]
+    fn a_size_that_does_not_fit_is_an_error(
+        #[case] id: Compression,
+        #[case] body: Vec<u8>,
+        #[case] declared: Option<usize>,
+        #[case] limit: usize,
+        #[case] want: Refusal,
+    ) {
+        let got = decode(id, &body, Expect { declared, limit }).unwrap_err();
+        check!(refusal(got) == want);
     }
 
     #[rstest]
@@ -266,5 +264,32 @@ mod tests {
     #[test]
     fn an_empty_prefixed_blob_has_no_id() {
         check!(let Err(DecodeError::Empty) = decode_prefixed(&[], exact(0)));
+    }
+
+    /// The legacy bzip2 size prefix is the only size an `md5`-mode page carries, so every edge of it is checked.
+    #[cfg(feature = "codec-bzip2")]
+    #[test]
+    fn a_legacy_bzip2_size_prefix_that_lies_is_an_error() {
+        let stream = bzip2_stream(TEXT);
+        let blob = |size: u32| {
+            let mut b = vec![2u8];
+            b.extend_from_slice(&size.to_be_bytes());
+            b.extend_from_slice(&stream);
+            b
+        };
+        let free = Expect {
+            declared: None,
+            limit: MIB,
+        };
+        check!(decode_prefixed(&blob(TEXT.len() as u32), free).unwrap() == TEXT);
+        for size in [0, 1, TEXT.len() as u32 - 1, TEXT.len() as u32 + 1, u32::MAX] {
+            check!(decode_prefixed(&blob(size), free).is_err(), "prefix {size}");
+        }
+        for len in 0..5 {
+            check!(
+                decode_prefixed(&blob(TEXT.len() as u32)[..len], free).is_err(),
+                "{len}-byte blob"
+            );
+        }
     }
 }

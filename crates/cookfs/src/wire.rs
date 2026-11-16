@@ -107,10 +107,4 @@ mod tests {
         check!(id.raw() == 42);
         check!(id.to_string() == "unknown (42)");
     }
-
-    #[test]
-    fn a_known_id_reports_its_name() {
-        check!(Compression::from_raw(255) == Compression::LEGACY_CUSTOM);
-        check!(Compression::LEGACY_CUSTOM.name() == Some("LEGACY_CUSTOM"));
-    }
 }

@@ -32,7 +32,7 @@ pub struct OpenOptions {
     /// On by default. Upstream writes an MD5 or CRC-32 of each decoded blob;
     /// one written without a hash is never checked either way.
     pub verify: bool,
-    pub(crate) password: Option<Vec<u8>>,
+    password: Option<Vec<u8>>,
 }
 
 impl OpenOptions {

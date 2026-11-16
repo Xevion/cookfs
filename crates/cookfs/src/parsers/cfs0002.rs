@@ -142,47 +142,10 @@ fn read<T: FromBytes, R: ReadAt>(src: &R, at: u64) -> Result<T, TrailerError> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::tests::kit::{archive_v2 as archive, crc_slot, sig_at};
     use assert2::check;
-
-    /// Builds a `CFS0002` archive from already-encoded page and fsindex blobs.
-    pub(crate) fn archive(pages: &[(Vec<u8>, [u8; 16])], fsindex: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for (blob, _) in pages {
-            buf.extend_from_slice(blob);
-        }
-        for (_, slot) in pages {
-            buf.extend_from_slice(slot);
-        }
-        for (blob, _) in pages {
-            buf.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-        }
-        buf.extend_from_slice(fsindex);
-        buf.extend_from_slice(&(fsindex.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&(pages.len() as u32).to_be_bytes());
-        buf.push(0);
-        buf.extend_from_slice(SIGNATURE);
-        buf
-    }
-
-    /// The `crc32`-mode slot upstream writes for a page that decodes to `decoded`.
-    pub(crate) fn crc_slot(decoded: &[u8]) -> [u8; 16] {
-        let mut slot = [0u8; 16];
-        slot[8..12].copy_from_slice(&(decoded.len() as u32).to_be_bytes());
-        slot[12..].copy_from_slice(&crc32fast::hash(decoded).to_be_bytes());
-        slot
-    }
-
-    /// The `md5`-mode slot upstream writes for a page that decodes to `decoded`.
-    pub(crate) fn md5_slot(decoded: &[u8]) -> [u8; 16] {
-        use md5::Digest;
-        md5::Md5::digest(decoded).into()
-    }
-
-    fn sig_at(buf: &[u8]) -> u64 {
-        (buf.len() - SIGNATURE.len()) as u64
-    }
 
     #[test]
     fn pages_are_located_by_summing_sizes_backward_from_the_trailer() {

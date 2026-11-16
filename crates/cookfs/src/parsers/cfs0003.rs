@@ -241,55 +241,10 @@ pub(crate) fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, Trailer
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::tests::kit::{archive_v3 as archive, pgindex, sig_at};
     use assert2::check;
-
-    /// A stored pgindex blob describing `pages` as `(compressed, uncompressed)` sizes.
-    pub(crate) fn pgindex(pages: &[(u32, u32)]) -> Vec<u8> {
-        let n = pages.len();
-        let mut blob = (n as u32).to_be_bytes().to_vec();
-        blob.extend(std::iter::repeat_n(0u8, 3 * n)); // stored, level 0, not encrypted
-        for &(c, _) in pages {
-            blob.extend_from_slice(&c.to_be_bytes());
-        }
-        for &(_, u) in pages {
-            blob.extend_from_slice(&u.to_be_bytes());
-        }
-        blob.extend(std::iter::repeat_n(0u8, 16 * n));
-        blob
-    }
-
-    /// Builds a `CFS0003` archive with stored pages and a stored fsindex.
-    pub(crate) fn archive(pages: &[Vec<u8>], fsindex: &[u8], encryption: u8) -> Vec<u8> {
-        let sizes: Vec<_> = pages
-            .iter()
-            .map(|p| (p.len() as u32, p.len() as u32))
-            .collect();
-        let pgindex = pgindex(&sizes);
-
-        let mut buf: Vec<u8> = pages.concat();
-        buf.extend_from_slice(&pgindex);
-        buf.extend_from_slice(fsindex);
-        buf.extend_from_slice(&[0, 0, encryption]);
-        for len in [pgindex.len(), fsindex.len()] {
-            buf.extend_from_slice(&[0, 0]);
-            buf.extend_from_slice(&[0; 16]);
-            buf.extend_from_slice(&(len as u32).to_be_bytes());
-            buf.extend_from_slice(&(len as u32).to_be_bytes());
-        }
-        buf.extend_from_slice(SIGNATURE);
-        buf
-    }
-
-    fn sig_at(buf: &[u8]) -> u64 {
-        (buf.len() - SIGNATURE.len()) as u64
-    }
-
-    #[test]
-    fn the_suffix_is_fifty_five_bytes() {
-        check!(SUFFIX_LEN == 55);
-    }
 
     #[test]
     fn pages_are_located_before_the_pgindex() {

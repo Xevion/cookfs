@@ -445,66 +445,13 @@ fn block(raw: &RawBlock) -> Option<Result<Block, IndexError>> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
+    use crate::tests::alloc::peak;
+    use crate::tests::kit::Fsindex;
     use assert2::{assert, check};
-
-    /// Builds fsindex blobs entry by entry, in the order they appear on disk.
-    #[derive(Default)]
-    pub(crate) struct Fsindex {
-        body: Vec<u8>,
-    }
-
-    impl Fsindex {
-        pub(crate) fn new(root_children: u32) -> Self {
-            let mut body = MAGIC.to_vec();
-            body.extend_from_slice(&root_children.to_be_bytes());
-            Self { body }
-        }
-
-        fn name(&mut self, name: &str) {
-            self.body.push(name.len() as u8);
-            self.body.extend_from_slice(name.as_bytes());
-            self.body.push(0);
-            self.body.extend_from_slice(&0i64.to_be_bytes());
-        }
-
-        pub(crate) fn file(mut self, name: &str, blocks: &[(i32, i32, i32)]) -> Self {
-            self.name(name);
-            self.body
-                .extend_from_slice(&(blocks.len() as i32).to_be_bytes());
-            for &block in blocks {
-                let fields: [i32; 3] = block.into();
-                for v in fields {
-                    self.body.extend_from_slice(&v.to_be_bytes());
-                }
-            }
-            self
-        }
-
-        pub(crate) fn dir(mut self, name: &str, children: u32) -> Self {
-            self.name(name);
-            self.body.extend_from_slice(&DIR_MARKER.to_be_bytes());
-            self.body.extend_from_slice(&children.to_be_bytes());
-            self
-        }
-
-        pub(crate) fn finish(self) -> Vec<u8> {
-            self.finish_with(&[])
-        }
-
-        /// Ends the tree with these raw metadata records.
-        pub(crate) fn finish_with(mut self, records: &[&[u8]]) -> Vec<u8> {
-            self.body
-                .extend_from_slice(&(records.len() as u32).to_be_bytes());
-            for record in records {
-                self.body
-                    .extend_from_slice(&(record.len() as u32).to_be_bytes());
-                self.body.extend_from_slice(record);
-            }
-            self.body
-        }
-    }
 
     fn paths(index: &Index) -> Vec<String> {
         index.walk(index.root).map(|(path, _)| path).collect()
@@ -541,16 +488,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_tree_deeper_than_the_limit_is_refused() {
-        let mut fs = Fsindex::new(1);
-        for _ in 0..4 {
-            fs = fs.dir("d", 1);
-        }
-        let blob = fs.file("f", &[]).finish();
-        check!(let Err(IndexError::TooDeep { limit: 3 }) = Index::parse(&blob, 3));
-    }
-
-    #[test]
     fn a_zero_size_block_on_page_minus_one_is_an_empty_file() {
         let blob = Fsindex::new(1).file("empty", &[(-1, 0, 0)]).finish();
         let index = Index::parse(&blob, 8).unwrap();
@@ -569,7 +506,13 @@ pub(crate) mod tests {
     fn a_child_count_larger_than_the_blob_fails_without_allocating() {
         let mut blob = MAGIC.to_vec();
         blob.extend_from_slice(&u32::MAX.to_be_bytes());
-        check!(let Err(IndexError::Truncated { .. }) = Index::parse(&blob, 8));
+        let (parsed, held) = peak(|| Index::parse(&blob, 8));
+        check!(let Err(IndexError::Truncated { .. }) = parsed);
+        check!(
+            held < 4096,
+            "a {}-byte blob claiming u32::MAX children held {held} bytes",
+            blob.len()
+        );
     }
 
     #[test]
@@ -639,5 +582,125 @@ pub(crate) mod tests {
         let mut blob = Fsindex::new(1).file("f", &[(0, 0, 4)]).finish();
         blob.truncate(blob.len() - 5);
         check!(let Err(IndexError::Truncated { .. }) = Index::parse(&blob, 8));
+    }
+
+    /// A chain of directories, each claiming as many children as the bytes after it could hold.
+    ///
+    /// Every claim passes the remaining-bytes check on its own, but each directory
+    /// reserves for its claim, so the reservations add up across the chain.
+    fn inflated_chain(depth: usize, pad: usize) -> Vec<u8> {
+        let claim = (pad / 14) as u32;
+        let mut fs = Fsindex::new(1);
+        for _ in 0..depth {
+            fs = fs.dir("d", claim);
+        }
+        let mut blob = fs.finish();
+        blob.truncate(blob.len() - 4); // no metadata: the parse fails before it
+        blob.extend(std::iter::repeat_n(0u8, pad)); // zeros parse as empty-named files
+        blob
+    }
+
+    /// The control for the chain below: as many entries, flat, held well within the bound.
+    #[test]
+    fn a_flat_tree_parses_within_a_small_multiple_of_its_size() {
+        let pad = 256 << 10;
+        let mut blob = Fsindex::new((pad / 14) as u32).finish();
+        blob.truncate(blob.len() - 4);
+        blob.extend(std::iter::repeat_n(0u8, pad / 14 * 14));
+        blob.extend_from_slice(&0u32.to_be_bytes());
+        let (parsed, held) = peak(|| Index::parse(&blob, 512));
+        assert!(parsed.is_ok());
+        check!(
+            held <= 16 * blob.len(),
+            "held {held} for a {}-byte blob",
+            blob.len()
+        );
+    }
+
+    #[test]
+    fn inflated_child_counts_in_nested_directories_reserve_in_proportion_to_the_blob() {
+        let blob = inflated_chain(500, 256 << 10);
+        let (parsed, held) = peak(|| Index::parse(&blob, 512));
+        check!(parsed.is_err());
+        check!(
+            held <= 16 * blob.len(),
+            "held {held} for a {}-byte blob",
+            blob.len()
+        );
+    }
+
+    /// A chain of long-named directories with many files at the bottom, stored uncompressed.
+    fn deep_wide(depth: usize, files: u32) -> Vec<u8> {
+        let name = "n".repeat(255);
+        let mut fs = Fsindex::new(1);
+        for level in 0..depth {
+            fs = fs.dir(&name, if level + 1 == depth { files } else { 1 });
+        }
+        for i in 0..files {
+            fs = fs.file(&i.to_string(), &[]);
+        }
+        fs.finish()
+    }
+
+    /// Every path is long, but a walk builds them one at a time, so what it holds stays near one path.
+    #[test]
+    fn walk_holds_memory_for_one_path_not_every_path() {
+        let blob = deep_wide(100, 1000);
+        let index = Index::parse(&blob, 512).unwrap();
+        let ((total, longest), held) = peak(|| {
+            index
+                .walk(index.root)
+                .fold((0, 0), |(total, longest), (path, _)| {
+                    (total + path.len(), longest.max(path.len()))
+                })
+        });
+        check!(total > 64 * blob.len());
+        // The path buffer, the copy handed out, and the stack of open directories.
+        check!(
+            held <= 4 * longest,
+            "walking {total} path bytes held {held}, the longest path being {longest}"
+        );
+    }
+
+    /// `max_depth` reads as the deepest directory nesting allowed, so that many nested directories should pass.
+    #[test]
+    fn max_depth_admits_exactly_that_many_nested_directories() {
+        for depth in 1..=4 {
+            let mut fs = Fsindex::new(1);
+            for _ in 0..depth {
+                fs = fs.dir("d", 1);
+            }
+            let blob = fs.file("f", &[]).finish();
+            check!(
+                Index::parse(&blob, depth).is_ok(),
+                "{depth} nested directories at max_depth {depth}"
+            );
+            assert!(let Err(IndexError::TooDeep { limit }) = Index::parse(&blob, depth - 1));
+            check!(limit == depth - 1);
+        }
+    }
+
+    /// A million entries at the root, each the smallest an entry can be; sharing one empty name, the last stands.
+    #[test]
+    fn a_million_tiny_entries_open_and_walk_in_bounded_time() {
+        const ENTRIES: u32 = 1_000_000;
+        let mut blob = Fsindex::new(ENTRIES).finish();
+        blob.truncate(blob.len() - 4);
+        blob.extend(std::iter::repeat_n(0u8, ENTRIES as usize * 14));
+        blob.extend_from_slice(&0u32.to_be_bytes());
+        let started = Instant::now();
+        let (index, held) = peak(|| Index::parse(&blob, 512).unwrap());
+        let walked = index.walk(index.root).count();
+        check!(walked == 1);
+        check!(
+            held <= 16 * blob.len(),
+            "held {held} for a {}-byte blob",
+            blob.len()
+        );
+        check!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }

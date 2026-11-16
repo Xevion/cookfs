@@ -4,7 +4,7 @@ use std::io::Read;
 #[cfg(feature = "codec-brotli")]
 use std::io::Write;
 
-pub(super) const TEXT: &[u8] = b"the quick brown fox jumps over the lazy dog";
+pub(crate) const TEXT: &[u8] = b"the quick brown fox jumps over the lazy dog";
 
 pub(super) fn exact(len: usize) -> super::Expect {
     super::Expect {
