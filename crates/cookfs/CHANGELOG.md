@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- A `CFS0002` archive written in the default `md5` hash mode reads correctly. Its hash slots
+  were read as `crc32`-mode sizes, which only that mode records.
 - A `CFS0002` bzip2 blob decodes; legacy writes its size ahead of the stream.
 - An empty file in a `CFS0003` archive, which upstream stores as a zero-size block on page -1,
   reads as empty instead of failing.

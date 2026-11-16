@@ -38,9 +38,15 @@ struct Head {
 struct Slot([u8; 16]);
 
 impl Slot {
-    /// The uncompressed size, which `crc32` hash mode stores at offset 8.
-    fn declared_len(self) -> u32 {
-        u32::from_be_bytes([self.0[8], self.0[9], self.0[10], self.0[11]])
+    /// The uncompressed size, which only `crc32` hash mode records.
+    ///
+    /// That mode writes `[0, 0, size, crc32]`; the default `md5` mode writes a
+    /// digest, which carries no size, and an all-zero slot is an unhashed page.
+    fn declared_len(self) -> Option<u32> {
+        let unhashed = self.0 == [0; 16];
+        let crc_mode = self.0[..8] == [0; 8];
+        (crc_mode && !unhashed)
+            .then(|| u32::from_be_bytes([self.0[8], self.0[9], self.0[10], self.0[11]]))
     }
 }
 
@@ -72,7 +78,7 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
                 at,
                 len: size.get(),
                 codec: Codec::Prefixed,
-                declared: Some(slot.declared_len()),
+                declared: slot.declared_len(),
             };
             at += u64::from(size.get());
             page
@@ -151,6 +157,15 @@ pub(crate) mod tests {
             .collect();
         check!(got == [(0, 10, Some(100)), (10, 20, Some(200))]);
         check!(let Some(BlobRef { at: 70, len: 7, .. }) = layout.fsindex);
+    }
+
+    #[test]
+    fn only_a_crc32_slot_declares_a_size() {
+        let mut md5 = [0xA5u8; 16];
+        md5[8..12].copy_from_slice(&100u32.to_be_bytes());
+        check!(Slot(md5).declared_len().is_none());
+        check!(Slot([0; 16]).declared_len().is_none());
+        check!(Slot(crc_slot(100)).declared_len() == Some(100));
     }
 
     #[test]
