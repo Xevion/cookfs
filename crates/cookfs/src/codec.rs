@@ -4,11 +4,13 @@ use std::io::Read;
 
 use snafu::{ResultExt, Snafu, ensure};
 
+use crate::parsers::cfs0002::LEGACY_CODECS;
 use crate::wire::Compression;
 
 /// A blob that could not be decoded.
 #[derive(Debug, Snafu)]
 #[snafu(module, context(suffix(false)), visibility(pub(crate)))]
+#[non_exhaustive]
 pub enum CodecError {
     /// The id names no codec this crate knows.
     #[snafu(display("unknown compression id {}", id.raw()))]
@@ -27,6 +29,9 @@ pub enum CodecError {
     /// A `CFS0002` blob had no leading id byte.
     #[snafu(display("blob is empty, so it has no compression id"))]
     Empty,
+    /// A legacy bzip2 blob ends before the decoded size it must carry.
+    #[snafu(display("bzip2 blob is too short to hold its size prefix"))]
+    NoSizePrefix,
     /// The codec rejected the payload.
     #[snafu(display("{id} payload failed to decode"))]
     Decompress {
@@ -79,8 +84,11 @@ pub(crate) struct Expect {
 pub(crate) fn decode_prefixed(blob: &[u8], expect: Expect) -> Result<Vec<u8>, CodecError> {
     let (&id, body) = blob.split_first().ok_or(CodecError::Empty)?;
     let id = Compression::from_raw(id);
+    ensure!(LEGACY_CODECS.contains(&id), codec_error::Unknown { id });
     if id == Compression::BZIP2 {
-        let (size, stream) = body.split_first_chunk::<4>().ok_or(CodecError::Empty)?;
+        let (size, stream) = body
+            .split_first_chunk::<4>()
+            .ok_or(CodecError::NoSizePrefix)?;
         let expect = Expect {
             declared: expect
                 .declared
@@ -89,6 +97,19 @@ pub(crate) fn decode_prefixed(blob: &[u8], expect: Expect) -> Result<Vec<u8>, Co
         };
         return decode(id, stream, expect);
     }
+    decode(id, body, expect)
+}
+
+/// Decodes a `CFS0003` blob, whose codec a table names; BitRock's legacy slot is not among them.
+pub(crate) fn decode_external(
+    id: Compression,
+    body: &[u8],
+    expect: Expect,
+) -> Result<Vec<u8>, CodecError> {
+    ensure!(
+        id != Compression::LEGACY_CUSTOM,
+        codec_error::Unknown { id }
+    );
     decode(id, body, expect)
 }
 
@@ -107,6 +128,10 @@ pub(crate) fn decode(id: Compression, body: &[u8], expect: Expect) -> Result<Vec
         }
         None => expect.limit,
     };
+    // Upstream never decodes a page declared empty, whatever its codec.
+    if expect.declared == Some(0) {
+        return Ok(Vec::new());
+    }
 
     let out = match id {
         Compression::NONE => {
@@ -213,7 +238,12 @@ fn lzma_alone(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, Cod
     let split = HEADER_LEN.min(body.len());
     let mut header = [0u8; HEADER_LEN];
     header[..split].copy_from_slice(&body[..split]);
-    clamp_dictionary(&mut header, limit);
+    // The header may record the decoded size, which bounds the dictionary tighter than the limit.
+    let recorded = u64::from_le_bytes([
+        header[5], header[6], header[7], header[8], header[9], header[10], header[11], header[12],
+    ]);
+    let output = usize::try_from(recorded).map_or(limit, |n| n.min(limit));
+    clamp_dictionary(&mut header, output);
 
     let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
         .map_err(std::io::Error::other)
@@ -454,6 +484,18 @@ mod tests {
         let mut body = raw_lzma1_stream(TEXT);
         body[1..5].copy_from_slice(&0xFFFF_FFBFu32.to_le_bytes());
         check!(decode(Compression::LZMA, &body, exact(TEXT.len())).unwrap() == TEXT);
+    }
+
+    #[test]
+    fn a_page_declared_empty_is_empty_without_decoding() {
+        check!(decode(Compression::LZMA, &[], exact(0)).unwrap().is_empty());
+    }
+
+    #[rstest]
+    #[case::zstd_in_a_legacy_blob(decode_prefixed(&[4, 0, 0], exact(1)))]
+    #[case::legacy_lzma_in_a_cfs0003_blob(decode_external(Compression::LEGACY_CUSTOM, &[0], exact(1)))]
+    fn a_codec_the_format_cannot_name_is_unknown(#[case] got: Result<Vec<u8>, CodecError>) {
+        check!(let Err(CodecError::Unknown { .. }) = got);
     }
 
     #[test]

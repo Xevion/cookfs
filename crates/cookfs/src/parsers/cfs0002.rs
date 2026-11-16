@@ -16,9 +16,10 @@ use snafu::ResultExt;
 use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use super::{TrailerError, before, trailer_error};
+use super::{TrailerError, addressable, before, trailer_error};
 use crate::page::{BlobRef, Codec, Layout};
 use crate::source;
+use crate::wire::Compression;
 
 /// The seven bytes that end a `CFS0002` trailer.
 pub(crate) const SIGNATURE: &[u8] = b"CFS0002";
@@ -50,6 +51,41 @@ impl Slot {
     }
 }
 
+/// Bytes each page adds to the tables before the fsindex: a hash slot and a size.
+const PER_PAGE: u64 = (size_of::<Slot>() + size_of::<U32>()) as u64;
+
+/// Whether a signature at `sig_at` ends a trailer worth parsing, judged from a few bytes.
+///
+/// The scan asks this of every hit, so it reads only the head and the
+/// fsindex's codec byte, and allocates nothing. A real archive always has an
+/// fsindex, so an all-zero head (a stray signature after padding) is refused.
+pub(crate) fn plausible<R: ReadAt>(src: &R, sig_at: u64) -> bool {
+    let Some(head_at) = sig_at.checked_sub(size_of::<Head>() as u64) else {
+        return false;
+    };
+    let Ok(head) = read::<Head, _>(src, head_at) else {
+        return false;
+    };
+    let fsindex_len = u64::from(head.fsindex_len.get());
+    let tables = u64::from(head.page_count.get()) * PER_PAGE;
+    let Some(fsindex_at) = head_at.checked_sub(fsindex_len) else {
+        return false;
+    };
+    let mut id = [0u8];
+    fsindex_len > 0
+        && tables <= fsindex_at
+        && src.read_exact_at(fsindex_at, &mut id).is_ok()
+        && LEGACY_CODECS.contains(&Compression::from_raw(id[0]))
+}
+
+/// The codecs a `CFS0002` blob can name; the legacy writer knows no others.
+pub(crate) const LEGACY_CODECS: [Compression; 4] = [
+    Compression::NONE,
+    Compression::ZLIB,
+    Compression::BZIP2,
+    Compression::LEGACY_CUSTOM,
+];
+
 /// Parses the trailer behind a `CFS0002` signature at `sig_at`.
 pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerError> {
     let head_at = before("trailer head", sig_at, size_of::<Head>() as u64)?;
@@ -57,14 +93,16 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
     let pages = u64::from(head.page_count.get());
 
     let fsindex_len = head.fsindex_len.get();
+    snafu::ensure!(fsindex_len > 0, trailer_error::NoFsindex);
     let fsindex_at = before("fsindex", head_at, fsindex_len.into())?;
     let sizes_at = before("page size table", fsindex_at, pages * 4)?;
     let slots_at = before("page hash table", sizes_at, pages * 16)?;
 
-    let sizes_raw = source::at(src, sizes_at, (pages * 4) as usize).context(trailer_error::Read)?;
+    let sizes_raw = source::at(src, sizes_at, addressable("page size table", pages * 4)?)
+        .context(trailer_error::Read)?;
     let sizes = <[U32]>::ref_from_bytes(&sizes_raw).unwrap_or(&[]);
-    let slots_raw =
-        source::at(src, slots_at, (pages * 16) as usize).context(trailer_error::Read)?;
+    let slots_raw = source::at(src, slots_at, addressable("page hash table", pages * 16)?)
+        .context(trailer_error::Read)?;
     let slots = <[Slot]>::ref_from_bytes(&slots_raw).unwrap_or(&[]);
 
     let total: u64 = sizes.iter().map(|s| u64::from(s.get())).sum();
@@ -79,6 +117,7 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
                 len: size.get(),
                 codec: Codec::Prefixed,
                 declared: slot.declared_len(),
+                encrypted: false,
             };
             at += u64::from(size.get());
             page
@@ -87,12 +126,13 @@ pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerEr
 
     Ok(Layout {
         pages,
-        fsindex: (fsindex_len > 0).then_some(BlobRef {
+        fsindex: BlobRef {
             at: fsindex_at,
             len: fsindex_len,
             codec: Codec::Prefixed,
             declared: None,
-        }),
+            encrypted: false,
+        },
         encryption: None,
     })
 }
@@ -156,7 +196,7 @@ pub(crate) mod tests {
             .map(|p| (p.at, p.len, p.declared))
             .collect();
         check!(got == [(0, 10, Some(100)), (10, 20, Some(200))]);
-        check!(let Some(BlobRef { at: 70, len: 7, .. }) = layout.fsindex);
+        check!(let BlobRef { at: 70, len: 7, .. } = layout.fsindex);
     }
 
     #[test]
@@ -169,18 +209,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_empty_fsindex_means_no_tree() {
+    fn an_empty_fsindex_is_refused() {
         let buf = archive(&[], b"");
-        let layout = parse(&buf.as_slice(), sig_at(&buf)).unwrap();
-        check!(layout.fsindex.is_none());
+        check!(let Err(TrailerError::NoFsindex) = parse(&buf.as_slice(), sig_at(&buf)));
+    }
+
+    #[test]
+    fn plausibility_needs_an_fsindex_with_a_legacy_codec_that_fits() {
+        let real = archive(&[(vec![0; 10], crc_slot(10))], &[1, 2, 3]);
+        check!(plausible(&real.as_slice(), sig_at(&real)));
+
+        let zeros = archive(&[], b"");
+        check!(!plausible(&zeros.as_slice(), sig_at(&zeros)));
+
+        let zstd_id = archive(&[], &[4, 0]);
+        check!(!plausible(&zstd_id.as_slice(), sig_at(&zstd_id)));
+
+        let mut huge = real;
+        let count_at = huge.len() - SIGNATURE.len() - 5;
+        huge[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        check!(!plausible(&huge.as_slice(), sig_at(&huge)));
     }
 
     #[test]
     fn a_page_count_larger_than_the_file_is_an_underflow() {
-        let mut buf = vec![0u8; 9];
-        buf[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
-        buf.extend_from_slice(SIGNATURE);
-        check!(let Err(TrailerError::Underflow { region: "page size table", .. }) = parse(&buf.as_slice(), 9));
+        let mut buf = archive(&[], &[0]);
+        let count_at = buf.len() - SIGNATURE.len() - 5;
+        buf[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        check!(let Err(TrailerError::Underflow { region: "page size table", .. }) = parse(&buf.as_slice(), sig_at(&buf)));
     }
 
     #[test]

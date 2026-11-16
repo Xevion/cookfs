@@ -13,6 +13,11 @@
 - Errors are split per layer (`SourceError`, `TrailerError`, `IndexError`, `CodecError`),
   with `Error` wrapping them.
 - `Block` fields are unsigned.
+- The `cache` module, `PageCache`, `Budget` and `Page` are no longer public.
+- The public error enums, `Kind`, `ArchiveVersion`, `Blob`, `Node` and `Block` are
+  `#[non_exhaustive]`.
+- `Limits` gains `max_file_len` (1 GiB by default), past which `Archive::read` refuses a file.
+- A directory's children are sorted by name.
 
 ### Fixed
 
@@ -28,6 +33,22 @@
 - An encrypted `CFS0003` archive is refused instead of read as garbage.
 - A deeply nested fsindex can no longer overflow the stack.
 - A crafted LZMA dictionary size or file size can no longer force a multi-GiB allocation.
+- A source packed with signatures is refused quickly; each hit was a full trailer parse.
+- A stray all-zero trailer no longer opens as an empty archive in place of a damaged one.
+- The page cache is bounded by decoded bytes, not page count, so pages that decode far larger
+  than their compressed size cannot hold gigabytes resident.
+- A file whose blocks cycle through pages stops with `Error::Overdecoded` instead of
+  decoding a page per block.
+- Nested directory counts no longer reserve memory the blob cannot fill.
+- A `KEY_INDEX` archive is reported as `Error::Encrypted`, not as a corrupt pgindex.
+- A page the pgindex flags as encrypted is refused instead of returned as plaintext.
+- A name repeated in one directory keeps its last entry, as upstream does, and a file and
+  directory sharing a name are refused.
+- An fsindex with no metadata section, as archives before 2011 have, parses.
+- Bytes after the last pgindex record are refused, as upstream does.
+- A blob naming a codec its format cannot hold is refused: zstd or brotli in `CFS0002`,
+  BitRock's LZMA slot in `CFS0003`.
+- A page declared empty is empty without decoding.
 
 ## 0.1.0 (2026-08-24)
 

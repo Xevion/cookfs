@@ -13,6 +13,8 @@ pub struct Limits {
     pub max_fsindex_len: usize,
     /// Largest decoded page or pgindex, in bytes.
     pub max_page_len: usize,
+    /// Largest file [`crate::Archive::read`] returns, in bytes.
+    pub max_file_len: u64,
     /// Deepest directory nesting the fsindex may describe.
     pub max_depth: usize,
 }
@@ -22,6 +24,8 @@ impl Limits {
     pub const DEFAULT_MAX_FSINDEX_LEN: usize = 256 << 20;
     /// 1 GiB. Real pages run from hundreds of KiB to tens of MiB.
     pub const DEFAULT_MAX_PAGE_LEN: usize = 1 << 30;
+    /// 1 GiB, since a file is read whole into memory.
+    pub const DEFAULT_MAX_FILE_LEN: u64 = 1 << 30;
     /// Deeper than any real install tree, shallow enough to bound the walk.
     pub const DEFAULT_MAX_DEPTH: usize = 512;
 }
@@ -31,6 +35,7 @@ impl Default for Limits {
         Self {
             max_fsindex_len: Self::DEFAULT_MAX_FSINDEX_LEN,
             max_page_len: Self::DEFAULT_MAX_PAGE_LEN,
+            max_file_len: Self::DEFAULT_MAX_FILE_LEN,
             max_depth: Self::DEFAULT_MAX_DEPTH,
         }
     }

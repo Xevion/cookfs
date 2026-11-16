@@ -10,6 +10,7 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 /// A read that ran past the end of a blob.
 #[derive(Debug, Snafu)]
 #[snafu(module, context(suffix(false)), visibility(pub(crate)))]
+#[non_exhaustive]
 pub enum BytesError {
     /// A read wanted more bytes than remain.
     #[snafu(display("read of {want} bytes at {at} overruns a {len}-byte blob"))]

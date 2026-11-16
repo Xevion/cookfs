@@ -15,7 +15,7 @@ use snafu::ResultExt;
 use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use super::{TrailerError, before, trailer_error};
+use super::{TrailerError, addressable, before, trailer_error};
 use crate::Limits;
 use crate::bytes::Reader;
 use crate::page::{BlobRef, Codec, Layout};
@@ -117,24 +117,30 @@ impl Suffix {
         })
     }
 
-    /// Whether the pgindex and fsindex this suffix describes fit before it, as upstream checks before trusting it.
-    pub(crate) fn fits_before(&self, sig_at: u64) -> bool {
+    /// Whether this suffix is worth parsing: its indexes fit before it, as upstream checks, and it has an fsindex.
+    pub(crate) fn plausible(&self, sig_at: u64) -> bool {
         let indexes = u64::from(self.pgindex.size_compressed.get())
             + u64::from(self.fsindex.size_compressed.get());
-        indexes + SUFFIX_LEN <= sig_at
+        self.fsindex.size_compressed.get() > 0 && indexes + SUFFIX_LEN <= sig_at
+    }
+
+    /// The archive's encryption mode and level.
+    pub(crate) fn encryption(&self) -> Encryption {
+        Encryption::from(self.encryption)
     }
 }
 
-/// Parses the suffix, pgindex and page table behind a `CFS0003` signature.
+/// Parses the pgindex and page table behind a `CFS0003` suffix read at `sig_at`.
 pub(crate) fn parse<R: ReadAt>(
     src: &R,
     sig_at: u64,
+    suffix: &Suffix,
     limits: &Limits,
 ) -> Result<Layout, TrailerError> {
-    let suffix = Suffix::read(src, sig_at)?;
-    let suffix_at = sig_at - SUFFIX_LEN;
+    let suffix_at = before("trailer suffix", sig_at, SUFFIX_LEN)?;
 
     let fsindex_len = suffix.fsindex.size_compressed.get();
+    snafu::ensure!(fsindex_len > 0, trailer_error::NoFsindex);
     let fsindex_at = before("fsindex", suffix_at, fsindex_len.into())?;
     let pgindex_len = suffix.pgindex.size_compressed.get();
     let pgindex_at = before("pgindex", fsindex_at, pgindex_len.into())?;
@@ -143,7 +149,8 @@ pub(crate) fn parse<R: ReadAt>(
         Vec::new()
     } else {
         let pgindex = blob(pgindex_at, suffix.pgindex);
-        let raw = source::at(src, pgindex_at, pgindex_len as usize).context(trailer_error::Read)?;
+        let raw = source::at(src, pgindex_at, addressable("pgindex", pgindex_len.into())?)
+            .context(trailer_error::Read)?;
         let plain = pgindex
             .decode(&raw, limits.max_page_len)
             .context(trailer_error::PgindexBlob)?;
@@ -152,8 +159,8 @@ pub(crate) fn parse<R: ReadAt>(
 
     Ok(Layout {
         pages,
-        fsindex: (fsindex_len > 0).then(|| blob(fsindex_at, suffix.fsindex)),
-        encryption: Some(Encryption::from(suffix.encryption)),
+        fsindex: blob(fsindex_at, suffix.fsindex),
+        encryption: Some(suffix.encryption()),
     })
 }
 
@@ -163,6 +170,7 @@ const fn blob(at: u64, info: BlobInfo) -> BlobRef {
         len: info.size_compressed.get(),
         codec: Codec::External(Compression::from_raw(info.compression)),
         declared: Some(info.size_uncompressed.get()),
+        encrypted: false,
     }
 }
 
@@ -184,7 +192,7 @@ pub(crate) fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, Trailer
 
     let compression = r.take(n).context(trailer_error::PgindexLayout)?;
     r.take(n).context(trailer_error::PgindexLayout)?; // levels
-    r.take(n).context(trailer_error::PgindexLayout)?; // encryption flags
+    let encrypted = r.take(n).context(trailer_error::PgindexLayout)?;
     let compressed = r
         .records::<U32>(count)
         .context(trailer_error::PgindexLayout)?;
@@ -193,20 +201,28 @@ pub(crate) fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, Trailer
         .context(trailer_error::PgindexLayout)?;
     r.records::<[u8; 16]>(count)
         .context(trailer_error::PgindexLayout)?;
+    snafu::ensure!(
+        r.remaining() == 0,
+        trailer_error::PgindexTrailing {
+            extra: r.remaining()
+        }
+    );
 
     let total: u64 = compressed.iter().map(|s| u64::from(s.get())).sum();
     let mut at = before("page data", end, total)?;
 
     Ok(compression
         .iter()
+        .zip(encrypted)
         .zip(compressed)
         .zip(uncompressed)
-        .map(|((&id, len), declared)| {
+        .map(|(((&id, &flag), len), declared)| {
             let page = BlobRef {
                 at,
                 len: len.get(),
                 codec: Codec::External(Compression::from_raw(id)),
                 declared: Some(declared.get()),
+                encrypted: flag != 0,
             };
             at += u64::from(len.get());
             page
@@ -268,7 +284,8 @@ pub(crate) mod tests {
     #[test]
     fn pages_are_located_before_the_pgindex() {
         let buf = archive(&[vec![1; 10], vec![2; 20]], b"fsindex", 0);
-        let layout = parse(&buf.as_slice(), sig_at(&buf), &Limits::default()).unwrap();
+        let suffix = Suffix::read(&buf.as_slice(), sig_at(&buf)).unwrap();
+        let layout = parse(&buf.as_slice(), sig_at(&buf), &suffix, &Limits::default()).unwrap();
         let got: Vec<_> = layout.pages.iter().map(|p| (p.at, p.len)).collect();
         check!(got == [(0, 10), (10, 20)]);
     }
@@ -292,12 +309,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_empty_pgindex_and_fsindex_describe_an_empty_archive() {
+    fn an_all_zero_suffix_is_not_plausible() {
         let mut buf = vec![0u8; 55];
         buf.extend_from_slice(SIGNATURE);
-        let layout = parse(&buf.as_slice(), 55, &Limits::default()).unwrap();
-        check!(layout.pages.is_empty());
-        check!(layout.fsindex.is_none());
+        let suffix = Suffix::read(&buf.as_slice(), 55).unwrap();
+        check!(!suffix.plausible(55));
+        check!(let Err(TrailerError::NoFsindex) = parse(&buf.as_slice(), 55, &suffix, &Limits::default()));
+    }
+
+    #[test]
+    fn bytes_after_the_last_pgindex_record_are_refused() {
+        let mut blob = pgindex(&[(1, 1)]);
+        blob.push(0);
+        check!(let Err(TrailerError::PgindexTrailing { extra: 1 }) = page_table(&blob, 1 << 40));
+    }
+
+    #[test]
+    fn the_pgindex_flags_each_encrypted_page() {
+        let mut blob = pgindex(&[(1, 1), (1, 1)]);
+        blob[4 + 2 * 2 + 1] = 1;
+        let pages = page_table(&blob, 1 << 40).unwrap();
+        check!(pages.iter().map(|p| p.encrypted).collect::<Vec<_>>() == [false, true]);
     }
 
     #[test]

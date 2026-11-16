@@ -15,6 +15,7 @@ pub(crate) mod cfs0003;
 /// A trailer that does not describe a readable archive.
 #[derive(Debug, Snafu)]
 #[snafu(module, context(suffix(false)), visibility(pub(crate)))]
+#[non_exhaustive]
 pub enum TrailerError {
     /// No known signature parsed as a trailer anywhere in the source.
     #[snafu(display("no cookfs signature found"))]
@@ -29,6 +30,17 @@ pub enum TrailerError {
         /// Where the region must end.
         end: u64,
     },
+    /// A region is larger than this platform can address.
+    #[snafu(display("{region} of {len} bytes does not fit in memory"))]
+    Oversized {
+        /// What the region holds.
+        region: &'static str,
+        /// The region's length as the trailer records it.
+        len: u64,
+    },
+    /// The trailer records no fsindex, which every archive upstream writes has.
+    #[snafu(display("trailer records an empty fsindex"))]
+    NoFsindex,
     /// Reading a trailer region failed.
     #[snafu(display("trailer region could not be read"))]
     Read {
@@ -40,6 +52,12 @@ pub enum TrailerError {
     PgindexBlob {
         /// The decoder's failure.
         source: CodecError,
+    },
+    /// The decoded `CFS0003` pgindex is longer than its own page count allows.
+    #[snafu(display("pgindex has {extra} bytes after its last record"))]
+    PgindexTrailing {
+        /// How many bytes were left unread.
+        extra: usize,
     },
     /// The decoded `CFS0003` pgindex is shorter than its own page count requires.
     #[snafu(display("pgindex is truncated"))]
@@ -55,4 +73,9 @@ const _: () = assert!(size_of::<TrailerError>() <= 64);
 fn before(region: &'static str, end: u64, len: u64) -> Result<u64, TrailerError> {
     end.checked_sub(len)
         .ok_or(TrailerError::Underflow { region, len, end })
+}
+
+/// A region length the trailer records, as a length this platform can allocate.
+fn addressable(region: &'static str, len: u64) -> Result<usize, TrailerError> {
+    usize::try_from(len).map_err(|_| TrailerError::Oversized { region, len })
 }

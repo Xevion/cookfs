@@ -11,8 +11,11 @@
 //! entry*:   u8 name_len, name, NUL, i64 mtime, i32 block_count
 //!           block_count == -1: u32 child_count, then the children
 //!           otherwise:         block_count * (i32 page, i32 offset, i32 size)
-//! u32 metadata count, then per record: u32 len, len bytes
+//! u32 metadata count, then per record: u32 len, len bytes (absent in old archives)
 //! ```
+//!
+//! A name repeated within one directory keeps its last entry, as upstream's
+//! import does, provided both are files or both directories.
 
 use la_arena::Arena;
 pub use la_arena::Idx;
@@ -28,6 +31,7 @@ pub(crate) const MAGIC: &[u8; 8] = b"CFS2.200";
 /// A decoded fsindex that does not describe a valid tree.
 #[derive(Debug, Snafu)]
 #[snafu(module, context(suffix(false)), visibility(pub(crate)))]
+#[non_exhaustive]
 pub enum IndexError {
     /// The blob does not open with `CFS2.200`.
     #[snafu(display("fsindex magic is {found:02x?}, not CFS2.200"))]
@@ -63,6 +67,12 @@ pub enum IndexError {
         /// The count as stored.
         count: i32,
     },
+    /// One directory holds a file and a directory of the same name.
+    #[snafu(display("fsindex holds both a file and a directory named {name:?}"))]
+    KindConflict {
+        /// The name both entries carry.
+        name: String,
+    },
     /// Bytes remain after the tree and its metadata.
     #[snafu(display("fsindex has {extra} bytes after its metadata"))]
     Trailing {
@@ -75,6 +85,7 @@ const _: () = assert!(size_of::<IndexError>() <= 64);
 
 /// One byte range of a file's contents, inside one decoded page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Block {
     /// Index of the page in the archive's page table.
     pub page: u32,
@@ -86,8 +97,9 @@ pub struct Block {
 
 /// What a node is: a directory of children, or a file's blocks.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Kind {
-    /// A directory, holding its children in fsindex order.
+    /// A directory, holding its children sorted by name.
     Dir(Vec<Idx<Node>>),
     /// A file, holding the blocks that make up its contents in order.
     File(Vec<Block>),
@@ -95,6 +107,7 @@ pub enum Kind {
 
 /// One entry in the tree.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Node {
     /// The entry's own name, not its path.
     pub name: String,
@@ -152,18 +165,6 @@ const DIR_MARKER: i32 = -1;
 const MIN_ENTRY_LEN: usize = 1 + 1 + size_of::<EntryHead>();
 
 impl Index {
-    /// A tree holding only the root, for an archive written with no fsindex.
-    pub(crate) fn empty() -> Self {
-        let mut nodes = Arena::new();
-        let root = nodes.alloc(Node {
-            name: String::new(),
-            mtime: 0,
-            parent: None,
-            kind: Kind::Dir(Vec::new()),
-        });
-        Self { nodes, root }
-    }
-
     /// Parses a decoded fsindex blob into a tree no deeper than `max_depth`.
     pub(crate) fn parse(blob: &[u8], max_depth: usize) -> Result<Self, IndexError> {
         let mut found = [0u8; 8];
@@ -184,7 +185,9 @@ impl Index {
         let mut open = vec![(root, read_child_count(&mut r)?)];
         while let Some((dir, left)) = open.last_mut() {
             if *left == 0 {
+                let dir = *dir;
                 open.pop();
+                settle(&mut nodes, dir)?;
                 continue;
             }
             *left -= 1;
@@ -199,7 +202,9 @@ impl Index {
             let (kind, children) = match head.block_count.get() {
                 DIR_MARKER => {
                     let count = read_child_count(&mut r)?;
-                    (Kind::Dir(Vec::with_capacity(count)), Some(count))
+                    // Not pre-sized: the count is checked against bytes left, which
+                    // every open directory above has already claimed too.
+                    (Kind::Dir(Vec::new()), Some(count))
                 }
                 count @ 0.. => {
                     let raw = r
@@ -232,7 +237,11 @@ impl Index {
         }
 
         // Archive-wide key/value records follow the tree; consumed here so a
-        // desynchronized parse cannot pass as complete.
+        // desynchronized parse cannot pass as complete. Archives older than
+        // the metadata section end with the tree.
+        if r.remaining() == 0 {
+            return Ok(Self { nodes, root });
+        }
         let count = r.record::<U32>().context(index_error::Truncated)?.get();
         let count = r
             .check_count(count, size_of::<U32>())
@@ -263,14 +272,12 @@ impl Index {
         out
     }
 
-    /// Pushes a directory's children in reverse name order, so popping yields them sorted.
+    /// Pushes a directory's children in reverse, so popping yields them in name order.
     fn queue_children(&self, dir: Idx<Node>, prefix: &str, pending: &mut Vec<(Idx<Node>, String)>) {
         let Kind::Dir(children) = &self.nodes[dir].kind else {
             return;
         };
-        let mut sorted = children.clone();
-        sorted.sort_by(|&a, &b| self.nodes[b].name.cmp(&self.nodes[a].name));
-        pending.extend(sorted.into_iter().map(|child| {
+        pending.extend(children.iter().rev().map(|&child| {
             let name = &self.nodes[child].name;
             let path = if prefix.is_empty() {
                 name.clone()
@@ -280,6 +287,35 @@ impl Index {
             (child, path)
         }));
     }
+}
+
+/// Sorts a finished directory's children by name, keeping the last of any repeated name.
+///
+/// A dropped entry stays in the arena but is no longer reachable from the root.
+fn settle(nodes: &mut Arena<Node>, dir: Idx<Node>) -> Result<(), IndexError> {
+    let Kind::Dir(children) = &mut nodes[dir].kind else {
+        return Ok(());
+    };
+    let mut children = std::mem::take(children);
+    // Stable, so within a run of one name the fsindex order survives and the last entry is last.
+    children.sort_by(|&a, &b| nodes[a].name.cmp(&nodes[b].name));
+    let mut kept: Vec<Idx<Node>> = Vec::with_capacity(children.len());
+    for child in children {
+        match kept.last_mut() {
+            Some(prev) if nodes[*prev].name == nodes[child].name => {
+                ensure!(
+                    nodes[*prev].is_dir() == nodes[child].is_dir(),
+                    index_error::KindConflict {
+                        name: nodes[child].name.clone()
+                    }
+                );
+                *prev = child;
+            }
+            _ => kept.push(child),
+        }
+    }
+    nodes[dir].kind = Kind::Dir(kept);
+    Ok(())
 }
 
 fn read_child_count(r: &mut Reader<'_>) -> Result<usize, IndexError> {
@@ -429,6 +465,44 @@ pub(crate) mod tests {
     #[test]
     fn the_wrong_magic_is_refused() {
         check!(let Err(IndexError::BadMagic { .. }) = Index::parse(b"not the magic", 8));
+    }
+
+    #[test]
+    fn a_repeated_name_keeps_its_last_entry() {
+        let blob = Fsindex::new(3)
+            .file("f", &[(0, 0, 1)])
+            .file("g", &[])
+            .file("f", &[(0, 0, 2)])
+            .finish();
+        let index = Index::parse(&blob, 8).unwrap();
+        let walked = index.walk();
+        check!(walked.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>() == ["f", "g"]);
+        check!(index.nodes[walked[0].1].size() == 2);
+    }
+
+    #[test]
+    fn a_repeated_directory_drops_the_earlier_ones_children() {
+        let blob = Fsindex::new(2)
+            .dir("d", 1)
+            .file("old", &[])
+            .dir("d", 1)
+            .file("new", &[])
+            .finish();
+        let index = Index::parse(&blob, 8).unwrap();
+        check!(paths(&index) == ["d", "d/new"]);
+    }
+
+    #[test]
+    fn a_file_and_directory_sharing_a_name_are_refused() {
+        let blob = Fsindex::new(2).file("x", &[]).dir("x", 0).finish();
+        check!(let Err(IndexError::KindConflict { .. }) = Index::parse(&blob, 8));
+    }
+
+    #[test]
+    fn an_fsindex_ending_after_its_tree_has_no_metadata() {
+        let mut blob = Fsindex::new(1).file("f", &[]).finish();
+        blob.truncate(blob.len() - 4);
+        check!(paths(&Index::parse(&blob, 8).unwrap()) == ["f"]);
     }
 
     #[test]

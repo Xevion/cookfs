@@ -27,6 +27,8 @@ pub(crate) struct BlobRef {
     pub(crate) codec: Codec,
     /// Decoded length, when the archive records one.
     pub(crate) declared: Option<u32>,
+    /// Whether the pgindex flags the page as encrypted.
+    pub(crate) encrypted: bool,
 }
 
 impl BlobRef {
@@ -37,7 +39,7 @@ impl BlobRef {
         };
         match self.codec {
             Codec::Prefixed => codec::decode_prefixed(raw, expect),
-            Codec::External(id) => codec::decode(id, raw, expect),
+            Codec::External(id) => codec::decode_external(id, raw, expect),
         }
     }
 }
@@ -47,8 +49,8 @@ impl BlobRef {
 pub(crate) struct Layout {
     /// Every data page, in page-index order.
     pub(crate) pages: Vec<BlobRef>,
-    /// The fsindex blob, or `None` for an archive written with an empty index.
-    pub(crate) fsindex: Option<BlobRef>,
+    /// The fsindex blob.
+    pub(crate) fsindex: BlobRef,
     /// The `CFS0003` encryption byte; `CFS0002` has none.
     pub(crate) encryption: Option<crate::Encryption>,
 }

@@ -12,6 +12,7 @@ use crate::source::SourceError;
 
 /// Which blob a decode failure belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Blob {
     /// A data page, by index.
     Page(u32),
@@ -64,6 +65,31 @@ pub enum Error {
     Encrypted {
         /// The archive's encryption mode.
         mode: EncryptionMode,
+    },
+    /// A page is flagged as encrypted in an archive whose suffix says it is not.
+    #[snafu(display("page {page} is flagged as encrypted"))]
+    EncryptedPage {
+        /// The page.
+        page: u32,
+    },
+    /// A file is larger than [`crate::Limits::max_file_len`] allows reading whole.
+    #[snafu(display("file of {size} bytes exceeds the {limit}-byte limit"))]
+    FileTooLarge {
+        /// The sum of the file's blocks.
+        size: u64,
+        /// The configured ceiling.
+        limit: u64,
+    },
+    /// A file's blocks make the reader decode far more than the file holds.
+    ///
+    /// A file written in order decodes each page it spans about once. Blocks
+    /// cycling through pages can instead force a decode per block.
+    #[snafu(display("file of {size} bytes needed {decoded} decoded bytes and counting"))]
+    Overdecoded {
+        /// The sum of the file's blocks.
+        size: u64,
+        /// Decoded page bytes consumed when the read stopped.
+        decoded: u64,
     },
     /// A file names a page the archive does not have.
     #[snafu(display("a file names page {page}, but the archive holds {pages}"))]

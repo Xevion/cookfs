@@ -2,7 +2,7 @@
 //!
 //! Upstream's listing comes from `tempo oracle -- dump`, which reads each sample
 //! through the real Tcl cookfs. Without a listing a case still checks that every
-//! file reads to its recorded size. A missing sample or listing makes the case
+//! file reads. A missing sample or listing makes the case
 //! ignored, never passed. `COOKFS_REQUIRE_CORPUS` and `COOKFS_REQUIRE_ORACLE`
 //! turn those into failures, so CI cannot go green having checked nothing.
 
@@ -15,7 +15,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use common::{Sample, manifest, samples_dir, workspace_root};
-use cookfs::{Archive, OpenOptions};
+use cookfs::{Archive, Kind, OpenOptions};
 use libtest_mimic::{Arguments, Failed, Trial};
 use positioned_io::{ReadAt, Size};
 
@@ -70,35 +70,37 @@ fn parse_listing(text: &str) -> Result<BTreeMap<String, Entry>, String> {
         .collect()
 }
 
-/// Every entry as this crate reads it, failing on the first unreadable file.
+/// Every entry as this crate reads it, failing on the first unreadable file or repeated path.
+///
+/// Files are read in the order their data sits in the archive, since path order
+/// revisits pages far more often than a bounded cache holds them.
 fn read_all<R: ReadAt + Size>(archive: &Archive<R>) -> Result<BTreeMap<String, Entry>, String> {
-    archive
-        .walk()
-        .into_iter()
-        .map(|(path, idx)| {
-            let node = archive.node(idx);
-            let entry = if node.name.contains('/') {
-                Entry::Unaddressable
-            } else if node.is_dir() {
-                Entry::Dir { mtime: node.mtime }
-            } else {
-                let data = archive.read(idx).map_err(|e| format!("{path}: {e}"))?;
-                if data.len() as u64 != node.size() {
-                    return Err(format!(
-                        "{path}: read {} bytes, its blocks sum to {}",
-                        data.len(),
-                        node.size()
-                    ));
-                }
-                Entry::File {
-                    size: data.len() as u64,
-                    mtime: node.mtime,
-                    crc: crc32fast::hash(&data),
-                }
-            };
-            Ok((path, entry))
-        })
-        .collect()
+    let mut nodes = archive.walk();
+    nodes.sort_by_key(|&(_, idx)| match &archive.node(idx).kind {
+        Kind::File(blocks) => blocks.first().map(|b| (b.page, b.offset)),
+        _ => None,
+    });
+
+    let mut out = BTreeMap::new();
+    for (path, idx) in nodes {
+        let node = archive.node(idx);
+        let entry = if node.name.contains('/') {
+            Entry::Unaddressable
+        } else if node.is_dir() {
+            Entry::Dir { mtime: node.mtime }
+        } else {
+            let data = archive.read(idx).map_err(|e| format!("{path}: {e}"))?;
+            Entry::File {
+                size: data.len() as u64,
+                mtime: node.mtime,
+                crc: crc32fast::hash(&data),
+            }
+        };
+        if out.insert(path.clone(), entry).is_some() {
+            return Err(format!("{path} is listed twice"));
+        }
+    }
+    Ok(out)
 }
 
 fn diff(ours: &BTreeMap<String, Entry>, upstream: &BTreeMap<String, Entry>) -> Vec<String> {

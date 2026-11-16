@@ -4,20 +4,20 @@
 //! with a per-page load gate, chosen from measurements over a corpus of real
 //! installers rather than from first principles.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lru::LruCache;
 use parking_lot::Mutex;
 
 /// A decompressed page, shared by every reader that asked for it.
-pub type Page = Arc<[u8]>;
+pub(crate) type Page = Arc<[u8]>;
 
-/// How much the cache may retain, derived from an archive's own page sizes.
+/// How many decoded bytes the cache may retain, derived from an archive's own page sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Budget {
-    /// Resident page count.
-    pub pages: usize,
+pub(crate) struct Budget {
+    /// Resident decoded bytes, past which the least recent pages are dropped.
+    pub(crate) bytes: usize,
 }
 
 impl Budget {
@@ -29,25 +29,36 @@ impl Budget {
     const FLOOR: u64 = 8 << 20;
     const CEILING: u64 = 128 << 20;
 
-    /// Sizes the cache from uncompressed page sizes, which the page table
-    /// carries before any page is read.
+    /// Sizes the cache from the page sizes the page table declares before any page is read.
     ///
     /// Page sizes span two orders of magnitude across real archives (hundreds
     /// of KB in IDA installers, tens of MB in Bitnami stacks), so any fixed
     /// value either thrashes on one shape or wastes memory on the other.
     /// Holding a couple of pages per worker lets each thread own one and still
-    /// reuse a neighbour's.
-    #[must_use]
-    pub fn from_pages(uncompressed: &[u32], workers: usize) -> Self {
-        let count = uncompressed.len().max(1);
-        let mean = (uncompressed.iter().map(|&s| u64::from(s)).sum::<u64>() / count as u64).max(1);
+    /// reuse a neighbour's. The sizes only steer the budget; eviction counts
+    /// the bytes each page really decoded to, so a lying table cannot inflate it.
+    pub(crate) fn from_pages(declared: &[u32], workers: usize) -> Self {
+        let count = declared.len().max(1);
+        let mean = declared.iter().map(|&s| u64::from(s)).sum::<u64>() / count as u64;
         let want = (2 * workers as u64 * mean).clamp(Self::FLOOR, Self::CEILING);
         Self {
-            // `count.max(2)` keeps the upper bound above the lower: a single-page
-            // archive would otherwise clamp with min > max, which panics.
-            pages: ((want / mean) as usize).clamp(2, count.max(2)),
+            bytes: usize::try_from(want).unwrap_or(usize::MAX),
         }
     }
+}
+
+/// One cached page and the decoded bytes it was counted at, both guarded by the cache.
+#[derive(Debug, Default)]
+struct Slot {
+    page: Mutex<Option<Page>>,
+    /// Bytes this slot adds to the cache's total; only touched under the outer lock.
+    counted: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct Slots {
+    lru: LruCache<usize, Arc<Slot>>,
+    bytes: usize,
 }
 
 /// An LRU of pages, where each entry gates concurrent loads of that page.
@@ -65,17 +76,20 @@ impl Budget {
 /// many-files-per-page archive burned fifteen times the CPU to finish slower
 /// than a single thread.
 #[derive(Debug)]
-pub struct PageCache {
-    slots: Mutex<LruCache<usize, Arc<Mutex<Option<Page>>>>>,
+pub(crate) struct PageCache {
+    slots: Mutex<Slots>,
+    budget: usize,
 }
 
 impl PageCache {
-    /// Builds a cache holding at most `budget.pages` decompressed pages, and never fewer than two.
-    #[must_use]
-    pub fn new(budget: Budget) -> Self {
-        let cap = NonZeroUsize::new(budget.pages.max(2)).unwrap_or(NonZeroUsize::MIN);
+    /// Builds a cache holding at most `budget.bytes` of decoded pages, beyond the one most recently loaded.
+    pub(crate) fn new(budget: Budget) -> Self {
         Self {
-            slots: Mutex::new(LruCache::new(cap)),
+            slots: Mutex::new(Slots {
+                lru: LruCache::unbounded(),
+                bytes: 0,
+            }),
+            budget: budget.bytes,
         }
     }
 
@@ -89,7 +103,7 @@ impl PageCache {
     ///
     /// Returns whatever `load` returns. A failed load caches nothing, so a
     /// later call retries.
-    pub fn get_or_load<E>(
+    pub(crate) fn get_or_load<E>(
         &self,
         n: usize,
         load: impl FnOnce() -> Result<Vec<u8>, E>,
@@ -97,17 +111,39 @@ impl PageCache {
         let slot = self
             .slots
             .lock()
-            .get_or_insert(n, || Arc::new(Mutex::new(None)))
+            .lru
+            .get_or_insert(n, || Arc::new(Slot::default()))
             .clone();
 
-        let mut guard = slot.lock();
+        let mut guard = slot.page.lock();
         if let Some(hit) = guard.as_ref() {
             return Ok(hit.clone());
         }
         let page: Page = load()?.into();
         *guard = Some(page.clone());
         drop(guard);
+        self.admit(n, &slot, page.len());
         Ok(page)
+    }
+
+    /// Counts a freshly loaded page, then drops the least recent others until the total fits.
+    fn admit(&self, n: usize, slot: &Arc<Slot>, len: usize) {
+        let mut slots = self.slots.lock();
+        // A slot evicted while it loaded is no longer the cache's to count.
+        if !slots.lru.peek(&n).is_some_and(|s| Arc::ptr_eq(s, slot)) {
+            return;
+        }
+        slot.counted.store(len, Ordering::Relaxed);
+        slots.bytes += len;
+        // The newest page stays even alone over budget, rather than never being cached.
+        slots.lru.promote(&n);
+        while slots.bytes > self.budget && slots.lru.len() > 1 {
+            let Some((_, oldest)) = slots.lru.pop_lru() else {
+                break;
+            };
+            slots.bytes -= oldest.counted.load(Ordering::Relaxed);
+        }
+        drop(slots);
     }
 }
 
@@ -123,7 +159,7 @@ mod tests {
 
     #[test]
     fn a_hit_does_not_call_load_again() {
-        let cache = PageCache::new(Budget { pages: 4 });
+        let cache = PageCache::new(Budget { bytes: 1 << 20 });
         let calls = AtomicUsize::new(0);
         let count = || {
             calls.fetch_add(1, Ordering::Relaxed);
@@ -137,7 +173,7 @@ mod tests {
 
     #[test]
     fn a_hit_shares_rather_than_copies() {
-        let cache = PageCache::new(Budget { pages: 4 });
+        let cache = PageCache::new(Budget { bytes: 1 << 20 });
         let first = cache.get_or_load(0, || Ok::<_, &str>(page(7))).unwrap();
         let second = cache.get_or_load(0, || Ok::<_, &str>(page(7))).unwrap();
         check!(Arc::ptr_eq(&first, &second));
@@ -147,7 +183,7 @@ mod tests {
     /// gate released the lock before loading, so this counted N, not 1.
     #[test]
     fn concurrent_misses_on_one_page_load_once() {
-        let cache = PageCache::new(Budget { pages: 4 });
+        let cache = PageCache::new(Budget { bytes: 1 << 20 });
         let calls = AtomicUsize::new(0);
 
         std::thread::scope(|s| {
@@ -169,7 +205,7 @@ mod tests {
 
     #[test]
     fn distinct_pages_do_not_block_each_other() {
-        let cache = PageCache::new(Budget { pages: 8 });
+        let cache = PageCache::new(Budget { bytes: 1 << 20 });
         let cache = &cache;
         let results: Vec<u8> = std::thread::scope(|s| {
             // Every thread must be spawned before any is joined, or they run
@@ -189,14 +225,14 @@ mod tests {
 
     #[test]
     fn a_failed_load_is_not_cached() {
-        let cache = PageCache::new(Budget { pages: 4 });
+        let cache = PageCache::new(Budget { bytes: 1 << 20 });
         check!(cache.get_or_load(0, || Err::<Vec<u8>, _>("boom")).is_err());
         check!(cache.get_or_load(0, || Ok::<_, &str>(page(9))).unwrap()[0] == 9);
     }
 
     #[test]
     fn eviction_keeps_the_cache_bounded() {
-        let cache = PageCache::new(Budget { pages: 2 });
+        let cache = PageCache::new(Budget { bytes: 16 });
         for i in 0..8 {
             cache
                 .get_or_load(i, || Ok::<_, &str>(page(i as u8)))
@@ -213,20 +249,40 @@ mod tests {
         check!(calls.load(Ordering::Relaxed) == 1);
     }
 
+    /// Pages that decode far larger than the table declares are still evicted by what they hold.
     #[test]
-    fn budget_adapts_to_page_size() {
-        // Small pages: many fit, capped by how many the archive has.
-        let small = Budget::from_pages(&[256 << 10; 600], 16);
-        check!(small.pages > 8);
-
-        // Large pages: the ceiling limits the count, but never below two.
-        let large = Budget::from_pages(&[35 << 20; 35], 16);
-        check!(large.pages >= 2);
-        check!(large.pages < 35);
+    fn eviction_counts_decoded_bytes_not_entries() {
+        let budget = Budget::from_pages(&[1; 64], 4);
+        let cache = PageCache::new(budget);
+        for i in 0..64 {
+            cache
+                .get_or_load(i, || Ok::<_, &str>(vec![0; 1 << 20]))
+                .unwrap();
+        }
+        let (bytes, held) = {
+            let slots = cache.slots.lock();
+            (slots.bytes, slots.lru.len())
+        };
+        check!(bytes <= budget.bytes);
+        check!(held == budget.bytes >> 20);
     }
 
     #[test]
-    fn budget_handles_an_empty_page_table() {
-        check!(Budget::from_pages(&[], 8).pages == 2);
+    fn a_page_larger_than_the_budget_is_still_kept_alone() {
+        let cache = PageCache::new(Budget { bytes: 4 });
+        cache.get_or_load(0, || Ok::<_, &str>(page(1))).unwrap();
+        cache.get_or_load(1, || Ok::<_, &str>(page(2))).unwrap();
+        let (held, newest) = {
+            let slots = cache.slots.lock();
+            (slots.lru.len(), slots.lru.peek(&1).is_some())
+        };
+        check!(held == 1);
+        check!(newest);
+    }
+
+    #[test]
+    fn the_budget_stays_between_its_floor_and_ceiling() {
+        check!(Budget::from_pages(&[], 8).bytes == Budget::FLOOR as usize);
+        check!(Budget::from_pages(&[u32::MAX; 4], 64).bytes == Budget::CEILING as usize);
     }
 }
