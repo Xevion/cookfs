@@ -71,3 +71,29 @@ missing_const_for_fn = "allow"
 # when the lint stops firing.
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
+
+# Own code at 1 keeps stack frames sane; the decoders the corpus tests lean on run at 2,
+# since every page of a sample decompresses through one of them.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.miniz_oxide]
+opt-level = 2
+
+[profile.dev.package.liblzma-sys]
+opt-level = 2
+
+[profile.dev.package.libbz2-rs-sys]
+opt-level = 2
+
+[profile.dev.package.brotli-decompressor]
+opt-level = 2
+
+[profile.dev.package.zstd-sys]
+opt-level = 2
+
+# Release with line tables for samply; never stripped.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
