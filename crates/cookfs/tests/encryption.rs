@@ -46,7 +46,6 @@ fn a_wrong_file_mode_password_fails_every_encrypted_read() {
     let archive = open("v3-encrypt-file", &wrong).unwrap();
     let failures: Vec<_> = archive
         .walk()
-        .into_iter()
         .filter(|&(_, idx)| archive.node(idx).size() > 0)
         .map(|(_, idx)| archive.read(idx))
         .collect();

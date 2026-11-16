@@ -75,7 +75,7 @@ fn parse_listing(text: &str) -> Result<BTreeMap<String, Entry>, String> {
 /// Files are read in the order their data sits in the archive, since path order
 /// revisits pages far more often than a bounded cache holds them.
 fn read_all<R: ReadAt + Size>(archive: &Archive<R>) -> Result<BTreeMap<String, Entry>, String> {
-    let mut nodes = archive.walk();
+    let mut nodes: Vec<_> = archive.walk().collect();
     nodes.sort_by_key(|&(_, idx)| match &archive.node(idx).kind {
         Kind::File(blocks) => blocks.first().map(|b| (b.page, b.offset)),
         _ => None,

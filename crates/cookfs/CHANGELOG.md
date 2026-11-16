@@ -4,6 +4,10 @@
 
 ### Breaking
 
+- Nodes are named by an opaque `NodeId` instead of a re-exported `la_arena::Idx`.
+- `Archive::walk` returns a lazy `Walk` iterator that builds one path at a time, instead of a
+  `Vec` holding every path at once.
+- `Archive::read` on a directory is `Error::NotAFile` instead of an empty `Vec`.
 - `Archive::open` takes `&OpenOptions`, and `open_with` is gone. Size ceilings live in
   `Limits`, which adds a page-size and a directory-depth ceiling to the fsindex one.
 - `Codec` is replaced by `Compression`, which keeps an unknown id's number instead of
@@ -29,6 +33,13 @@
 - Encrypted `CFS0003` archives read with `OpenOptions::with_password`, in all three of
   upstream's modes. A `KEY` or `KEY_INDEX` archive opened with the wrong password fails with
   `Error::WrongPassword`; a `FILE` one fails as its pages fail to decrypt.
+- `Archive::open_file` streams a file as `Read + Seek`, decoding pages only as it reaches
+  them and without `read`'s size limit.
+- `Archive::lookup` finds an entry by path, `Archive::page_order` lists files in the order
+  their data sits so each page decodes about once, and `Archive::root` is the directory
+  paths start from.
+- `Node::has_portable_name` and `Archive::has_portable_path` say whether a name or path is
+  safe to create on disk; upstream stores names such as `..` and ones holding `/`.
 - `Archive::metadata` and `Archive::metadata_entries` read the fsindex's archive-wide records.
 - Fileset archives list their active fileset as the root, as upstream mounts them.
   `Archive::filesets`, `Archive::fileset` and `Archive::select_fileset` list and switch them.

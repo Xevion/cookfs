@@ -17,8 +17,7 @@
 //! A name repeated within one directory keeps its last entry, as upstream's
 //! import does, provided both are files or both directories.
 
-use la_arena::Arena;
-pub use la_arena::Idx;
+use la_arena::{Arena, Idx};
 use snafu::{ResultExt, Snafu, ensure};
 use zerocopy::byteorder::big_endian::{I32, I64, U32};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
@@ -95,12 +94,30 @@ pub struct Block {
     pub size: u32,
 }
 
+/// A handle to one entry, valid only with the archive it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(Idx<Node>);
+
+impl std::ops::Index<NodeId> for Arena<Node> {
+    type Output = Node;
+
+    fn index(&self, id: NodeId) -> &Node {
+        &self[id.0]
+    }
+}
+
+impl std::ops::IndexMut<NodeId> for Arena<Node> {
+    fn index_mut(&mut self, id: NodeId) -> &mut Node {
+        &mut self[id.0]
+    }
+}
+
 /// What a node is: a directory of children, or a file's blocks.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Kind {
     /// A directory, holding its children sorted by name.
-    Dir(Vec<Idx<Node>>),
+    Dir(Vec<NodeId>),
     /// A file, holding the blocks that make up its contents in order.
     File(Vec<Block>),
 }
@@ -114,7 +131,7 @@ pub struct Node {
     /// Modification time as the writing Tcl runtime recorded it.
     pub mtime: i64,
     /// The parent directory, or `None` for the root.
-    pub parent: Option<Idx<Self>>,
+    pub parent: Option<NodeId>,
     /// Directory or file, with its payload.
     pub kind: Kind,
 }
@@ -124,6 +141,26 @@ impl Node {
     #[must_use]
     pub const fn is_dir(&self) -> bool {
         matches!(self.kind, Kind::Dir(_))
+    }
+
+    /// Whether the name is safe to use as one component of a path on disk.
+    ///
+    /// Upstream stores any bytes as a name, so an archive can hold an empty
+    /// name, `.` or `..`, or one containing a path separator or NUL. Joining
+    /// such a name onto a directory can escape it, so an extractor should
+    /// refuse or rename these.
+    #[must_use]
+    pub fn has_portable_name(&self) -> bool {
+        !matches!(self.name.as_str(), "" | "." | "..") && !self.name.contains(['/', '\\', '\0'])
+    }
+
+    /// The children of a directory, sorted by name, or none for a file.
+    #[must_use]
+    pub fn children(&self) -> &[NodeId] {
+        match &self.kind {
+            Kind::Dir(children) => children,
+            Kind::File(_) => &[],
+        }
     }
 
     /// Decoded size: the sum of a file's blocks, or 0 for a directory.
@@ -140,9 +177,9 @@ impl Node {
 #[derive(Debug)]
 pub(crate) struct Index {
     pub(crate) nodes: Arena<Node>,
-    pub(crate) root: Idx<Node>,
+    pub(crate) root: NodeId,
     /// The root entry written first, which upstream's directory table lists first.
-    pub(crate) first_at_root: Option<Idx<Node>>,
+    pub(crate) first_at_root: Option<NodeId>,
     /// Archive-wide key/value records, a repeated key keeping its last value.
     pub(crate) metadata: Vec<(String, Vec<u8>)>,
 }
@@ -178,12 +215,12 @@ impl Index {
 
         let mut r = Reader::new(&blob[MAGIC.len()..]);
         let mut nodes = Arena::new();
-        let root = nodes.alloc(Node {
+        let root = NodeId(nodes.alloc(Node {
             name: String::new(),
             mtime: 0,
             parent: None,
             kind: Kind::Dir(Vec::new()),
-        });
+        }));
 
         let mut first_name = None;
         // Each open directory with the count of its children still unread.
@@ -227,12 +264,12 @@ impl Index {
                 count => return index_error::BadBlockCount { count }.fail(),
             };
 
-            let idx = nodes.alloc(Node {
+            let idx = NodeId(nodes.alloc(Node {
                 name,
                 mtime: head.mtime.get(),
                 parent: Some(parent),
                 kind,
-            });
+            }));
             if let Kind::Dir(siblings) = &mut nodes[parent].kind {
                 siblings.push(idx);
             }
@@ -265,46 +302,69 @@ impl Index {
         })
     }
 
-    /// Every node in pre-order, siblings sorted by name, with its full path.
-    pub(crate) fn walk(&self, root: Idx<Node>) -> Vec<(String, Idx<Node>)> {
-        let mut out = Vec::new();
-        let mut pending = Vec::new();
-        self.queue_children(root, "", &mut pending);
-        while let Some((idx, path)) = pending.pop() {
-            self.queue_children(idx, &path, &mut pending);
-            out.push((path, idx));
-        }
-        out
-    }
-
-    /// Pushes a directory's children in reverse, so popping yields them in name order.
-    fn queue_children(&self, dir: Idx<Node>, prefix: &str, pending: &mut Vec<(Idx<Node>, String)>) {
-        let Kind::Dir(children) = &self.nodes[dir].kind else {
-            return;
+    /// Every node under `root` in pre-order, siblings sorted by name, with its path.
+    pub(crate) fn walk(&self, root: NodeId) -> Walk<'_> {
+        let children = match &self.nodes[root].kind {
+            Kind::Dir(children) => children.as_slice(),
+            Kind::File(_) => &[],
         };
-        pending.extend(children.iter().rev().map(|&child| {
-            let name = &self.nodes[child].name;
-            let path = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
+        Walk {
+            nodes: &self.nodes,
+            open: vec![(children.iter(), 0)],
+            path: String::new(),
+        }
+    }
+}
+
+/// Every entry under a directory in pre-order, siblings sorted by name, each with its path.
+///
+/// Paths join names with `/`, and are built one at a time in a single buffer,
+/// so walking holds memory for the deepest path rather than for every path.
+/// A name can itself hold `/` or be `..`; see [`Node::has_portable_name`].
+#[derive(Debug, Clone)]
+pub struct Walk<'a> {
+    nodes: &'a Arena<Node>,
+    /// Each open directory's remaining children, and the path length before its names.
+    open: Vec<(std::slice::Iter<'a, NodeId>, usize)>,
+    path: String,
+}
+
+impl Iterator for Walk<'_> {
+    type Item = (String, NodeId);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (children, prefix) = self.open.last_mut()?;
+            let Some(&child) = children.next() else {
+                self.open.pop();
+                continue;
             };
-            (child, path)
-        }));
+            let prefix = *prefix;
+            self.path.truncate(prefix);
+            if prefix > 0 {
+                self.path.push('/');
+            }
+            let node = &self.nodes[child];
+            self.path.push_str(&node.name);
+            if let Kind::Dir(grandchildren) = &node.kind {
+                self.open.push((grandchildren.iter(), self.path.len()));
+            }
+            return Some((self.path.clone(), child));
+        }
     }
 }
 
 /// Sorts a finished directory's children by name, keeping the last of any repeated name.
 ///
 /// A dropped entry stays in the arena but is no longer reachable from the root.
-fn settle(nodes: &mut Arena<Node>, dir: Idx<Node>) -> Result<(), IndexError> {
+fn settle(nodes: &mut Arena<Node>, dir: NodeId) -> Result<(), IndexError> {
     let Kind::Dir(children) = &mut nodes[dir].kind else {
         return Ok(());
     };
     let mut children = std::mem::take(children);
     // Stable, so within a run of one name the fsindex order survives and the last entry is last.
     children.sort_by(|&a, &b| nodes[a].name.cmp(&nodes[b].name));
-    let mut kept: Vec<Idx<Node>> = Vec::with_capacity(children.len());
+    let mut kept: Vec<NodeId> = Vec::with_capacity(children.len());
     for child in children {
         match kept.last_mut() {
             Some(prev) if nodes[*prev].name == nodes[child].name => {
@@ -440,11 +500,7 @@ pub(crate) mod tests {
     }
 
     fn paths(index: &Index) -> Vec<String> {
-        index
-            .walk(index.root)
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect()
+        index.walk(index.root).map(|(path, _)| path).collect()
     }
 
     #[test]
@@ -473,7 +529,7 @@ pub(crate) mod tests {
     fn a_file_sums_its_blocks() {
         let blob = Fsindex::new(1).file("f", &[(0, 0, 3), (1, 0, 4)]).finish();
         let index = Index::parse(&blob, 8).unwrap();
-        let (_, f) = index.walk(index.root)[0].clone();
+        let (_, f) = index.walk(index.root).next().unwrap();
         check!(index.nodes[f].size() == 7);
     }
 
@@ -491,7 +547,7 @@ pub(crate) mod tests {
     fn a_zero_size_block_on_page_minus_one_is_an_empty_file() {
         let blob = Fsindex::new(1).file("empty", &[(-1, 0, 0)]).finish();
         let index = Index::parse(&blob, 8).unwrap();
-        let (_, f) = index.walk(index.root)[0].clone();
+        let (_, f) = index.walk(index.root).next().unwrap();
         assert!(let Kind::File(blocks) = &index.nodes[f].kind);
         check!(blocks.is_empty());
     }
@@ -522,7 +578,7 @@ pub(crate) mod tests {
             .file("f", &[(0, 0, 2)])
             .finish();
         let index = Index::parse(&blob, 8).unwrap();
-        let walked = index.walk(index.root);
+        let walked: Vec<_> = index.walk(index.root).collect();
         check!(walked.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>() == ["f", "g"]);
         check!(index.nodes[walked[0].1].size() == 2);
     }

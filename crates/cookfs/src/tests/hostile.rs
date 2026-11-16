@@ -569,7 +569,6 @@ fn read_all(buf: Vec<u8>, limits: Limits) -> Result<BTreeMap<String, Option<Vec<
     )?;
     archive
         .walk()
-        .into_iter()
         .map(|(path, idx)| {
             let data = (!archive.node(idx).is_dir())
                 .then(|| archive.read(idx))
@@ -861,20 +860,23 @@ fn deep_wide(depth: usize, files: u32) -> Vec<u8> {
     fs.finish()
 }
 
+/// Every path is long, but a walk builds them one at a time, so what it holds stays near one path.
 #[test]
-#[ignore = "BUG: walk materializes every full path, so its output grows as files x depth x name length"]
-fn walk_output_stays_in_proportion_to_the_fsindex() {
+fn walk_holds_memory_for_one_path_not_every_path() {
     let blob = deep_wide(100, 1000);
     let index = crate::index::Index::parse(&blob, 512).unwrap();
-    let total: usize = index
-        .walk(index.root)
-        .iter()
-        .map(|(path, _)| path.len())
-        .sum();
+    let ((total, longest), held) = peak(|| {
+        index
+            .walk(index.root)
+            .fold((0, 0), |(total, longest), (path, _)| {
+                (total + path.len(), longest.max(path.len()))
+            })
+    });
+    check!(total > 64 * blob.len());
+    // The path buffer, the copy handed out, and the stack of open directories.
     check!(
-        total <= 64 * blob.len(),
-        "walk produced {total} path bytes from a {}-byte fsindex",
-        blob.len()
+        held <= 4 * longest,
+        "walking {total} path bytes held {held}, the longest path being {longest}"
     );
 }
 
@@ -928,7 +930,7 @@ fn a_read_that_fails_reserves_no_more_than_its_pages_hold() {
         cfs0002::tests::crc_slot(b"0123456789"),
     );
     let archive = super::open(cfs0002::tests::archive(&[page], &super::stored(&fsindex))).unwrap();
-    let (_, idx) = archive.walk().into_iter().next().unwrap();
+    let (_, idx) = archive.walk().next().unwrap();
     let (got, held) = peak(|| archive.read(idx));
     check!(let Err(Error::BlockOutOfPage { .. } | Error::FileTooLarge { .. }) = got);
     check!(
@@ -1004,7 +1006,7 @@ fn a_zero_size_block_is_skipped_whatever_its_page_and_offset() {
         cfs0002::tests::crc_slot(b"0123456789"),
     );
     let archive = super::open(cfs0002::tests::archive(&[page], &super::stored(&fsindex))).unwrap();
-    let (_, idx) = archive.walk().into_iter().next().unwrap();
+    let (_, idx) = archive.walk().next().unwrap();
     assert!(let Kind::File(blocks) = &archive.node(idx).kind);
     check!(blocks.len() == 1);
     check!(archive.read(idx).unwrap() == b"234");
@@ -1023,7 +1025,7 @@ fn a_block_ending_exactly_at_its_page_reads_and_one_byte_more_does_not() {
         cfs0002::tests::crc_slot(b"0123456789"),
     );
     let archive = super::open(cfs0002::tests::archive(&[page], &super::stored(&fsindex))).unwrap();
-    let files: BTreeMap<String, _> = archive.walk().into_iter().collect();
+    let files: BTreeMap<String, _> = archive.walk().collect();
     check!(archive.read(files["end"]).unwrap() == b"9");
     check!(let Err(Error::BlockOutOfPage { .. }) = archive.read(files["past"]));
     check!(let Err(Error::BlockOutOfPage { .. } | Error::FileTooLarge { .. }) = archive.read(files["far"]));
@@ -1041,7 +1043,7 @@ fn a_page_under_every_block_of_a_file_reads_it_that_many_times() {
         cfs0002::tests::crc_slot(b"0123456789"),
     );
     let archive = super::open(cfs0002::tests::archive(&[page], &super::stored(&fsindex))).unwrap();
-    let (_, idx) = archive.walk().into_iter().next().unwrap();
+    let (_, idx) = archive.walk().next().unwrap();
     let started = Instant::now();
     let data = archive.read(idx).unwrap();
     check!(data.len() == BLOCKS * 10);
@@ -1063,7 +1065,7 @@ fn a_million_tiny_entries_open_and_walk_in_bounded_time() {
     blob.extend_from_slice(&0u32.to_be_bytes());
     let started = Instant::now();
     let (index, held) = peak(|| crate::index::Index::parse(&blob, 512).unwrap());
-    let walked = index.walk(index.root).len();
+    let walked = index.walk(index.root).count();
     check!(walked == 1);
     check!(
         held <= 16 * blob.len(),

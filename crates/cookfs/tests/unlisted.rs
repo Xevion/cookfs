@@ -23,7 +23,6 @@ fn a_name_holding_a_newline_reads_back_whole(#[case] name: &str) {
     let archive = open(name).unwrap();
     let files: Vec<(String, Vec<u8>)> = archive
         .walk()
-        .into_iter()
         .filter(|&(_, idx)| !archive.node(idx).is_dir())
         .filter(|(path, _)| !path.contains('/'))
         .map(|(path, idx)| (path, archive.read(idx).unwrap()))

@@ -4,12 +4,30 @@
 //! tree encoding: `CFS0002`, the frozen legacy format InstallBuilder
 //! installers carry, and `CFS0003`, what upstream writes since 2024. Both
 //! are read transparently.
+//!
+//! ```no_run
+//! use std::fs::File;
+//!
+//! use cookfs::{Archive, OpenOptions};
+//!
+//! let archive = Archive::open(File::open("installer.run")?, &OpenOptions::default())?;
+//! // Data order decodes each page once; path order can decode one many times.
+//! for (path, id) in archive.page_order() {
+//!     // Names are whatever upstream stored, so refuse any that could escape the output.
+//!     if archive.has_portable_path(id) {
+//!         let contents = archive.read(id)?;
+//!         println!("{path}: {} bytes", contents.len());
+//!     }
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 mod bytes;
 mod cache;
 mod codec;
 mod crypto;
 mod error;
+mod file;
 mod index;
 mod limits;
 mod name;
@@ -31,7 +49,8 @@ use parsers::{cfs0002, cfs0003};
 pub use bytes::BytesError;
 pub use codec::CodecError;
 pub use error::{Blob, Error, Result};
-pub use index::{Block, Idx, IndexError, Kind, Node};
+pub use file::FileReader;
+pub use index::{Block, IndexError, Kind, Node, NodeId, Walk};
 pub use limits::Limits;
 pub use parsers::TrailerError;
 pub use parsers::cfs0003::{Encryption, EncryptionMode};
@@ -138,12 +157,12 @@ pub struct Archive<R> {
     pages: Vec<BlobRef>,
     index: Index,
     cache: PageCache,
-    limits: Limits,
+    pub(crate) limits: Limits,
     verify: bool,
     encryption: Option<Encryption>,
     key: Option<Key>,
     /// The fileset directory standing in for the root, when the archive has filesets.
-    fileset: Option<Idx<Node>>,
+    fileset: Option<NodeId>,
 }
 
 impl<R: ReadAt + Size> Archive<R> {
@@ -239,7 +258,7 @@ impl<R: ReadAt + Size> Archive<R> {
         self.encryption
     }
 
-    fn page(&self, n: u32) -> Result<Page> {
+    pub(crate) fn page(&self, n: u32) -> Result<Page> {
         let blob = *self.pages.get(n as usize).context(ctx::PageOutOfRange {
             page: n,
             pages: self.pages.len(),
@@ -262,68 +281,120 @@ impl<R: ReadAt + Size> Archive<R> {
         })
     }
 
-    /// Reads a file's full contents, or nothing for a directory.
+    /// Reads a file's full contents.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::FileTooLarge`] past [`Limits::max_file_len`],
-    /// [`Error::Decode`] when a page the file spans fails to decode,
-    /// [`Error::BlockOutOfPage`] when one of its blocks runs past its page, and
-    /// [`Error::Overdecoded`] when its blocks revisit pages far more than a
-    /// file written in order does.
-    pub fn read(&self, node: Idx<Node>) -> Result<Vec<u8>> {
-        let Kind::File(blocks) = &self.index.nodes[node].kind else {
-            return Ok(Vec::new());
-        };
-        let size = self.index.nodes[node].size();
+    /// Returns [`Error::NotAFile`] for a directory, [`Error::FileTooLarge`]
+    /// past [`Limits::max_file_len`], [`Error::Decode`] when a page the file
+    /// spans fails to decode, [`Error::BlockOutOfPage`] when one of its blocks
+    /// runs past its page, and [`Error::Overdecoded`] when its blocks revisit
+    /// pages far more than a file written in order does.
+    pub fn read(&self, id: NodeId) -> Result<Vec<u8>> {
+        let mut reader = self.open_file(id)?;
+        let size = reader.len();
         let limit = self.limits.max_file_len;
         ensure!(size <= limit, ctx::FileTooLarge { size, limit });
-        // An in-order file wastes at most the parts of its first and last pages it does not use.
-        let budget = size.saturating_add(2 * self.limits.max_page_len as u64);
-
         // Grown by what pages really return, not reserved from sizes the fsindex claims.
         let mut out = Vec::new();
-        let mut decoded = 0u64;
-        let mut current: Option<(u32, Page)> = None;
-        for &Block {
-            page,
-            offset,
-            size: len,
-        } in blocks
-        {
-            let data = match &current {
-                Some((held, data)) if *held == page => data.clone(),
-                _ => {
-                    let data = self.page(page)?;
-                    decoded += data.len() as u64;
-                    ensure!(decoded <= budget, ctx::Overdecoded { size, decoded });
-                    current = Some((page, data.clone()));
-                    data
-                }
-            };
-            let range = offset as usize..offset as usize + len as usize;
-            let bytes = data.get(range).context(ctx::BlockOutOfPage {
-                page,
-                offset,
-                size: len,
-                page_len: data.len(),
-            })?;
-            out.extend_from_slice(bytes);
+        while let Some((page, range)) = reader.chunk()? {
+            out.extend_from_slice(&page[range.clone()]);
+            reader.advance(range.len());
         }
         Ok(out)
     }
 
-    /// Looks up a node by its handle.
-    #[must_use]
-    pub fn node(&self, node: Idx<Node>) -> &Node {
-        &self.index.nodes[node]
+    /// Opens a file's contents as a stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotAFile`] for a directory. Reading the stream fails
+    /// as [`Self::read`] does, apart from the size limit.
+    pub fn open_file(&self, id: NodeId) -> Result<FileReader<'_, R>> {
+        match &self.index.nodes[id].kind {
+            Kind::File(blocks) => Ok(FileReader::new(self, blocks)),
+            _ => ctx::NotAFile.fail(),
+        }
     }
 
-    /// Every node in pre-order, siblings sorted by name, with its full path.
+    /// Looks up a node by its handle.
     ///
-    /// Paths are relative to the active fileset when the archive has one.
-    pub fn walk(&self) -> Vec<(String, Idx<Node>)> {
-        self.index.walk(self.fileset.unwrap_or(self.index.root))
+    /// # Panics
+    ///
+    /// If `id` came from another archive and is out of this one's range.
+    #[must_use]
+    pub fn node(&self, id: NodeId) -> &Node {
+        &self.index.nodes[id]
+    }
+
+    /// Whether every name from [`Self::root`] down to `id` is safe as a path component on disk.
+    ///
+    /// See [`Node::has_portable_name`]. Checking only the entry's own name
+    /// would miss a directory above it named `..`.
+    #[must_use]
+    pub fn has_portable_path(&self, id: NodeId) -> bool {
+        let root = self.root();
+        let mut at = id;
+        while at != root {
+            let node = self.node(at);
+            if !node.has_portable_name() {
+                return false;
+            }
+            match node.parent {
+                Some(parent) => at = parent,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// The directory paths are relative to: the active fileset, or the archive's root.
+    #[must_use]
+    pub fn root(&self) -> NodeId {
+        self.fileset.unwrap_or(self.index.root)
+    }
+
+    /// The entry at `path`, its names joined by `/`, relative to [`Self::root`].
+    ///
+    /// The empty path is the root. Like upstream, this cannot reach an entry
+    /// whose own name holds a `/`; [`Self::walk`] still lists it.
+    #[must_use]
+    pub fn lookup(&self, path: &str) -> Option<NodeId> {
+        let mut at = self.root();
+        if path.is_empty() {
+            return Some(at);
+        }
+        for part in path.split('/') {
+            let children = self.node(at).children();
+            let found = children
+                .binary_search_by(|&c| self.index.nodes[c].name.as_str().cmp(part))
+                .ok()?;
+            at = children[found];
+        }
+        Some(at)
+    }
+
+    /// Every entry under [`Self::root`] in pre-order, siblings sorted by name, with its path.
+    pub fn walk(&self) -> Walk<'_> {
+        self.index.walk(self.root())
+    }
+
+    /// Every file under [`Self::root`] with its path, in the order its data sits in the archive.
+    ///
+    /// Reading in this order decodes each page about once. Path order can
+    /// switch pages hundreds of times in a large archive, and pages past the
+    /// cache's budget then decode again on every return.
+    #[must_use]
+    pub fn page_order(&self) -> Vec<(String, NodeId)> {
+        let mut files: Vec<(String, NodeId)> = self
+            .walk()
+            .filter(|&(_, id)| !self.node(id).is_dir())
+            .collect();
+        files.sort_by_key(|&(_, id)| match &self.node(id).kind {
+            Kind::File(blocks) => blocks.first().map(|b| (b.page, b.offset)),
+            _ => None,
+        });
+        files
     }
 
     /// The value the fsindex records for an archive-wide metadata `key`.
@@ -403,7 +474,7 @@ impl<R: ReadAt + Size> Archive<R> {
 const FILESET_KEY: &str = "cookfs.fileset";
 
 /// The fileset upstream activates when it cannot match one to its runtime: the first root entry written.
-fn default_fileset(index: &Index) -> Option<Idx<Node>> {
+fn default_fileset(index: &Index) -> Option<NodeId> {
     let has_filesets = index.metadata.iter().any(|(k, _)| k == FILESET_KEY);
     index
         .first_at_root
@@ -551,7 +622,7 @@ mod tests {
         let archive = open(one_file_v2(b"hello world!")).unwrap();
         check!(archive.version() == ArchiveVersion::Cfs0002);
         check!(archive.encryption().is_none());
-        let (path, idx) = archive.walk().into_iter().next().unwrap();
+        let (path, idx) = archive.walk().next().unwrap();
         check!(path == "hello.txt");
         check!(archive.read(idx).unwrap() == b"hello world!");
     }
@@ -567,7 +638,7 @@ mod tests {
                     level: 15
                 })
         );
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        let (_, idx) = archive.walk().next().unwrap();
         check!(archive.read(idx).unwrap() == b"hello v3!");
     }
 
@@ -598,7 +669,7 @@ mod tests {
             cfs0002::tests::crc_slot(b"0123456789"),
         );
         let archive = open(cfs0002::tests::archive(&[page], &stored(&fsindex))).unwrap();
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        let (_, idx) = archive.walk().next().unwrap();
         check!(let Err(Error::BlockOutOfPage { page: 0, page_len: 10, .. }) = archive.read(idx));
     }
 
@@ -664,7 +735,7 @@ mod tests {
             cfs0002::tests::crc_slot(b"0123456789"),
         );
         let archive = open(cfs0002::tests::archive(&[page], &stored(&fsindex))).unwrap();
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        let (_, idx) = archive.walk().next().unwrap();
         check!(let Err(Error::FileTooLarge { size: 4_294_967_294, .. }) = archive.read(idx));
     }
 
@@ -687,7 +758,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        let (_, idx) = archive.walk().next().unwrap();
         check!(let Err(Error::FileTooLarge { size: 2_000_000, .. }) = archive.read(idx));
     }
 
@@ -710,7 +781,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        let (_, idx) = archive.walk().next().unwrap();
         check!(let Err(Error::Overdecoded { size: 30, decoded: 3000 }) = archive.read(idx));
     }
 
@@ -724,7 +795,7 @@ mod tests {
             (stored(b"wxyz"), cfs0002::tests::crc_slot(b"wxyz")),
         ];
         let archive = open(cfs0002::tests::archive(&pages, &stored(&fsindex))).unwrap();
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        let (_, idx) = archive.walk().next().unwrap();
         check!(archive.read(idx).unwrap() == b"abwxcd");
     }
 
@@ -745,7 +816,7 @@ mod tests {
         let mut buf = cfs0003::tests::archive(&[b"abc".to_vec()], &fsindex, 0x78);
         buf[3 + 4 + 2] = 1;
         let archive = open(buf).unwrap();
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        let (_, idx) = archive.walk().next().unwrap();
         check!(let Err(Error::EncryptedPage { page: 0 }) = archive.read(idx));
     }
 
@@ -757,7 +828,7 @@ mod tests {
         let buf = cfs0002::tests::archive(&[page], &stored(&fsindex));
 
         let archive = open(buf.clone()).unwrap();
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        let (_, idx) = archive.walk().next().unwrap();
         check!(let Err(Error::Decode { blob: Blob::Page(0), source: CodecError::HashMismatch { hash: "CRC-32" } }) = archive.read(idx));
 
         let lax = OpenOptions {
@@ -778,7 +849,7 @@ mod tests {
         let clean = std::fs::read(fixture).unwrap();
         let read_all = |buf: Vec<u8>| -> Result<()> {
             let archive = open(buf)?;
-            for (_, idx) in archive.walk() {
+            for (_, idx) in archive.page_order() {
                 archive.read(idx)?;
             }
             Ok(())
@@ -811,7 +882,7 @@ mod tests {
         let archive = two_filesets();
         check!(archive.filesets() == ["alpha", "zeta"]);
         check!(archive.fileset() == Some("zeta"));
-        let walked: Vec<String> = archive.walk().into_iter().map(|(p, _)| p).collect();
+        let walked: Vec<String> = archive.walk().map(|(p, _)| p).collect();
         check!(walked == ["z.txt"]);
         check!(archive.metadata("cookfs.fileset") == Some(&b"custom"[..]));
     }
@@ -820,7 +891,7 @@ mod tests {
     fn another_fileset_can_be_selected_and_a_missing_one_is_refused() {
         let mut archive = two_filesets();
         archive.select_fileset("alpha").unwrap();
-        let (path, idx) = archive.walk().into_iter().next().unwrap();
+        let (path, idx) = archive.walk().next().unwrap();
         check!(path == "a.txt");
         check!(archive.read(idx).unwrap() == b"a");
         check!(let Err(Error::NoSuchFileset { .. }) = archive.select_fileset("beta"));
@@ -833,6 +904,135 @@ mod tests {
         let archive = open(cfs0003::tests::archive(&[], &fsindex, 0x78)).unwrap();
         check!(archive.filesets().is_empty());
         check!(archive.fileset().is_none());
+    }
+
+    fn fixture(name: &str) -> Archive<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        open(std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// Streaming must agree with a whole read, in one go or in pieces that straddle blocks and pages.
+    #[rstest::rstest]
+    #[case::cfs0002("v2-zlib-md5.cfs")]
+    #[case::cfs0003("v3-zstd.cfs")]
+    fn a_stream_reads_what_read_returns(#[case] name: &str) {
+        use std::io::Read;
+        let archive = fixture(name);
+        for (path, id) in archive.page_order() {
+            let whole = archive.read(id).unwrap();
+            let mut streamed = Vec::new();
+            archive
+                .open_file(id)
+                .unwrap()
+                .read_to_end(&mut streamed)
+                .unwrap();
+            check!(streamed == whole, "{path}");
+
+            let mut reader = archive.open_file(id).unwrap();
+            let mut pieces = Vec::new();
+            let mut buf = [0u8; 999];
+            loop {
+                let n = reader.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                pieces.extend_from_slice(&buf[..n]);
+            }
+            check!(pieces == whole, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_stream_seeks_anywhere_in_its_file() {
+        use std::io::{Read, Seek, SeekFrom};
+        let archive = fixture("v3-zlib.cfs");
+        let id = archive.lookup("data/random.bin").unwrap();
+        let whole = archive.read(id).unwrap();
+        let mut reader = archive.open_file(id).unwrap();
+        check!(reader.len() == whole.len() as u64);
+
+        for at in [0, 1, 4095, 4096, 4097, 12_345, whole.len() - 1] {
+            reader.seek(SeekFrom::Start(at as u64)).unwrap();
+            let mut tail = Vec::new();
+            reader.read_to_end(&mut tail).unwrap();
+            check!(tail == whole[at..], "from {at}");
+        }
+        check!(reader.seek(SeekFrom::End(-3)).unwrap() == whole.len() as u64 - 3);
+        check!(reader.seek(SeekFrom::Current(10)).unwrap() == whole.len() as u64 + 7);
+        check!(reader.read(&mut [0; 8]).unwrap() == 0);
+        check!(
+            reader
+                .seek(SeekFrom::Current(-(whole.len() as i64) - 8))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lookup_follows_names_and_finds_nothing_for_a_missing_one() {
+        let archive = fixture("v3-zlib.cfs");
+        check!(archive.lookup("") == Some(archive.root()));
+        let deep = archive.lookup("nested/a/b/c/deep.txt").unwrap();
+        check!(archive.read(deep).unwrap() == b"deep\n");
+        check!(archive.node(archive.lookup("nested/a").unwrap()).is_dir());
+        for missing in ["nested/z", "nested//a", "readme.txt/x", "/readme.txt"] {
+            check!(archive.lookup(missing).is_none(), "{missing}");
+        }
+    }
+
+    #[test]
+    fn page_order_follows_the_data_not_the_names() {
+        let archive = fixture("v3-zlib.cfs");
+        let starts: Vec<_> = archive
+            .page_order()
+            .into_iter()
+            .filter_map(|(_, id)| match &archive.node(id).kind {
+                Kind::File(blocks) => blocks.first().map(|b| (b.page, b.offset)),
+                _ => None,
+            })
+            .collect();
+        check!(starts.windows(2).all(|w| w[0] <= w[1]));
+        check!(
+            archive.page_order().len()
+                == archive
+                    .walk()
+                    .filter(|&(_, id)| !archive.node(id).is_dir())
+                    .count()
+        );
+    }
+
+    #[test]
+    fn reading_a_directory_is_an_error() {
+        let archive = fixture("v3-zlib.cfs");
+        let dir = archive.lookup("data").unwrap();
+        check!(let Err(Error::NotAFile) = archive.read(dir));
+        check!(let Err(Error::NotAFile) = archive.open_file(dir));
+    }
+
+    #[test]
+    fn names_that_could_escape_a_directory_are_not_portable() {
+        let fsindex = Fsindex::new(6)
+            .file("ok.txt", &[])
+            .file("..", &[])
+            .file(".", &[])
+            .file("a/b", &[])
+            .file("back\\slash", &[])
+            .file("", &[])
+            .finish();
+        let archive = open(cfs0003::tests::archive(&[], &fsindex, 0x78)).unwrap();
+        let portable: Vec<String> = archive
+            .walk()
+            .filter(|&(_, id)| archive.node(id).has_portable_name())
+            .map(|(path, _)| path)
+            .collect();
+        check!(portable == ["ok.txt"]);
+
+        let fsindex = Fsindex::new(1).dir("..", 1).file("inner", &[]).finish();
+        let archive = open(cfs0003::tests::archive(&[], &fsindex, 0x78)).unwrap();
+        let inner = archive.lookup("../inner").unwrap();
+        check!(archive.node(inner).has_portable_name());
+        check!(!archive.has_portable_path(inner));
     }
 
     /// A stray all-zero trailer before a damaged archive once opened as an empty one.

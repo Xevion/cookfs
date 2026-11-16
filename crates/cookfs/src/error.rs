@@ -97,6 +97,9 @@ pub enum Error {
         /// Decoded page bytes consumed when the read stopped.
         decoded: u64,
     },
+    /// The entry is a directory, which has no contents to read.
+    #[snafu(display("entry is a directory, not a file"))]
+    NotAFile,
     /// No fileset of that name is in the archive.
     #[snafu(display("archive has no fileset named {name:?}"))]
     NoSuchFileset {
