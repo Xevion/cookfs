@@ -11,7 +11,7 @@
 //! encrypted. Layout verified against upstream `generic/pages.c`.
 
 use positioned_io::ReadAt;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
@@ -19,7 +19,8 @@ use super::{Layout, TrailerError, addressable, before, trailer_error};
 use crate::Limits;
 use crate::blob::{BlobRef, Codec};
 use crate::bytes::Reader;
-use crate::crypto::{Encryption, EncryptionMode, Key};
+use crate::crypto::{self, Encryption, EncryptionMode, Key};
+use crate::error::{Result as CrateResult, error as ctx};
 use crate::source;
 use crate::wire::Compression;
 
@@ -106,6 +107,30 @@ impl Suffix {
     pub(crate) fn encryption(&self) -> Encryption {
         Encryption::from(self.encryption)
     }
+}
+
+/// The key an encrypted archive's blobs decrypt with, from the data after the signature at `sig_at`.
+///
+/// `None` for an archive that is not encrypted.
+pub(crate) fn archive_key<R: ReadAt>(
+    src: &R,
+    sig_at: u64,
+    suffix: &Suffix,
+    password: Option<&[u8]>,
+) -> CrateResult<Option<Key>> {
+    let encryption = suffix.encryption();
+    let mode = encryption.mode;
+    if mode == EncryptionMode::NONE {
+        return Ok(None);
+    }
+    let password = password.context(ctx::Encrypted { mode })?;
+    let stored = source::at(
+        src,
+        sig_at + SIGNATURE.len() as u64,
+        crypto::stored_len(mode),
+    )
+    .context(trailer_error::Read)?;
+    Key::from_stored(password, encryption, &stored).map(Some)
 }
 
 /// Parses the pgindex and page table behind a `CFS0003` suffix read at `sig_at`.

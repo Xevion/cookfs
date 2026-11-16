@@ -79,7 +79,7 @@ impl<'a, R: ReadAt + Size> FileReader<'a, R> {
     /// A file read in order from here wastes at most the unused parts of its first and last pages.
     fn reset_budget(&mut self) {
         self.decoded = 0;
-        let pages = 2 * self.archive.limits.max_page_len as u64;
+        let pages = 2 * self.archive.max_page_len() as u64;
         self.budget = (self.size - self.pos.min(self.size)).saturating_add(pages);
     }
 

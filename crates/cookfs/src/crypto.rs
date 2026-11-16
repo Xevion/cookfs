@@ -9,9 +9,10 @@
 
 use aes::Aes256;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
-use snafu::ensure;
+use snafu::{OptionExt, ensure};
 
 use crate::codec::{DecodeError, decode_error};
+use crate::error::{Result, error as ctx};
 
 crate::wire::wire_enum! {
     /// How a `CFS0003` archive is encrypted.
@@ -37,11 +38,26 @@ pub struct Encryption {
 }
 
 /// AES's block, and the length of every IV and salt here.
-pub(crate) const BLOCK: usize = 16;
+const BLOCK: usize = 16;
 /// An AES-256 key.
 pub(crate) const KEY_LEN: usize = 32;
 /// A stored data key: the key itself, then a copy of the IV it was encrypted under.
-pub(crate) const WRAPPED_KEY_LEN: usize = KEY_LEN + BLOCK;
+const WRAPPED_KEY_LEN: usize = KEY_LEN + BLOCK;
+
+/// Whether the encryption data holds a stored data key, as `KEY` and `KEY_INDEX` archives do.
+fn stores_data_key(mode: EncryptionMode) -> bool {
+    mode == EncryptionMode::KEY || mode == EncryptionMode::KEY_INDEX
+}
+
+/// How many bytes of encryption data follow the signature of an archive in `mode`.
+pub(crate) fn stored_len(mode: EncryptionMode) -> usize {
+    BLOCK
+        + if stores_data_key(mode) {
+            BLOCK + WRAPPED_KEY_LEN
+        } else {
+            0
+        }
+}
 
 /// The key every encrypted blob in one archive decrypts with.
 #[derive(Clone)]
@@ -66,6 +82,27 @@ impl Key {
         // Upstream at level 0 runs the first round alone, which is what one round computes.
         pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password, salt, rounds.max(1), &mut key);
         Self(key)
+    }
+
+    /// The key an archive's blobs decrypt with, from `stored`, the encryption data behind its signature.
+    pub(crate) fn from_stored(
+        password: &[u8],
+        Encryption { mode, level }: Encryption,
+        stored: &[u8],
+    ) -> Result<Self> {
+        let (salt, rest) = stored
+            .split_first_chunk::<BLOCK>()
+            .context(ctx::Encrypted { mode })?;
+        let derived = Self::derive(password, salt, level);
+        if !stores_data_key(mode) {
+            return Ok(derived);
+        }
+        let (iv, wrapped) = rest
+            .split_first_chunk::<BLOCK>()
+            .context(ctx::Encrypted { mode })?;
+        let wrapped: &[u8; WRAPPED_KEY_LEN] =
+            wrapped.try_into().ok().context(ctx::Encrypted { mode })?;
+        derived.unwrap(iv, wrapped).context(ctx::WrongPassword)
     }
 
     /// Recovers the data key `KEY` and `KEY_INDEX` archives store, or `None` for a wrong password.

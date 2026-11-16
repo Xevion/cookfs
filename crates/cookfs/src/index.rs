@@ -282,9 +282,12 @@ impl Index {
             }
         }
 
-        let first_at_root = first_name.and_then(|name| match &nodes[root].kind {
-            Kind::Dir(children) => children.iter().copied().find(|&c| nodes[c].name == name),
-            Kind::File(_) => None,
+        let first_at_root = first_name.and_then(|name| {
+            nodes[root]
+                .children()
+                .iter()
+                .copied()
+                .find(|&c| nodes[c].name == name)
         });
 
         let metadata = read_metadata(&mut r)?;
@@ -302,15 +305,19 @@ impl Index {
         })
     }
 
+    /// The value recorded for the metadata `key`.
+    pub(crate) fn metadata(&self, key: &str) -> Option<&[u8]> {
+        self.metadata
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_slice())
+    }
+
     /// Every node under `root` in pre-order, siblings sorted by name, with its path.
     pub(crate) fn walk(&self, root: NodeId) -> Walk<'_> {
-        let children = match &self.nodes[root].kind {
-            Kind::Dir(children) => children.as_slice(),
-            Kind::File(_) => &[],
-        };
         Walk {
             nodes: &self.nodes,
-            open: vec![(children.iter(), 0)],
+            open: vec![(self.nodes[root].children().iter(), 0)],
             path: String::new(),
         }
     }

@@ -1,8 +1,7 @@
 //! Reads from the random-access source an archive is opened over.
 //!
 //! Neither format has a header at the front of the file. A reader locates the
-//! archive by scanning backward for a trailer signature and walking each
-//! format's own length-prefixed fields outward from there.
+//! archive by scanning backward for a trailer signature.
 
 use positioned_io::ReadAt;
 use snafu::{ResultExt, Snafu};
