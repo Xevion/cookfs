@@ -1,4 +1,4 @@
-//! One case per corpus sample: open it, read every file, and diff against upstream.
+//! One case per corpus sample and per fixture: open it, read every file, and diff against upstream.
 //!
 //! Upstream's listing comes from `tempo oracle -- dump`, which reads each sample
 //! through the real Tcl cookfs. Without a listing a case still checks that every
@@ -146,8 +146,8 @@ fn unzip(path: &Path) -> Result<Vec<u8>, String> {
 fn check<R: ReadAt + Size>(src: R, listing: Option<&Path>) -> Result<(), Failed> {
     let archive = Archive::open(src, &OpenOptions::default()).map_err(|e| format!("open: {e}"))?;
     let ours = read_all(&archive)?;
-    if ours.is_empty() {
-        return Err("the tree is empty".into());
+    if ours.is_empty() && listing.is_none() {
+        return Err("the tree is empty and there is no listing to say it should be".into());
     }
     let Some(listing) = listing else {
         return Ok(());
@@ -204,13 +204,46 @@ fn trial(sample: Sample, dir: &Path, listings: &Path) -> Trial {
     .with_kind(sample.format.to_lowercase())
 }
 
+/// Archives upstream wrote for cases the corpus lacks, each beside upstream's listing of it.
+fn fixtures() -> Vec<Trial> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures");
+    let mut names: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "cfs"))
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "no fixtures in {}", dir.display());
+
+    names
+        .into_iter()
+        .map(|archive| {
+            let name = archive
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Trial::test(name, move || {
+                let listing = archive.with_extension("tsv");
+                check(
+                    fs::read(&archive).map_err(|e| e.to_string())?,
+                    Some(&listing),
+                )
+            })
+            .with_kind("fixture")
+        })
+        .collect()
+}
+
 fn main() {
     let dir = samples_dir();
     let listings = oracle_dir().join("manifests");
-    let trials = manifest()
+    let mut trials: Vec<Trial> = manifest()
         .into_iter()
         .filter(|s| s.format != "none")
         .map(|s| trial(s, &dir, &listings))
         .collect();
+    trials.extend(fixtures());
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
 }

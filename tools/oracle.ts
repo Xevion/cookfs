@@ -13,6 +13,8 @@ const ROOT = resolve(import.meta.dirname, "..");
 const DIR = process.env.COOKFS_ORACLE_DIR ?? join(ROOT, "target", "oracle");
 const SAMPLES = process.env.COOKFS_CORPUS_DIR ?? join(ROOT, "samples");
 const DUMP = join(ROOT, "tools", "oracle", "dump.tcl");
+const WRITE = join(ROOT, "tools", "oracle", "fixtures.tcl");
+const FIXTURES = join(ROOT, "crates", "cookfs", "tests", "fixtures");
 
 type Flavor = "legacy" | "current";
 
@@ -190,10 +192,25 @@ async function dump(args: string[]): Promise<void> {
   if (failed > 0) die(`${failed} of ${samples.length} samples failed`);
 }
 
+/// Has upstream write the fixture archives, then list each back as the oracle for it.
+async function fixtures(): Promise<void> {
+  await mkdir(FIXTURES, { recursive: true });
+  for (const flavor of ["legacy", "current"] as Flavor[]) {
+    const lib = await library(flavor);
+    const names = (await output(["tclsh", WRITE, flavor, lib, FIXTURES], ROOT)).trim().split("\n");
+    for (const name of names) {
+      const listing = await output(["tclsh", DUMP, flavor, lib, join(FIXTURES, `${name}.cfs`)], ROOT);
+      await Bun.write(join(FIXTURES, `${name}.tsv`), listing);
+      console.log(`${name}: ${listing.split("\n").length - 1} entries`);
+    }
+  }
+}
+
 const USAGE = `oracle <command>
 
   build             fetch and build both pinned upstream trees under target/oracle
-  dump [sample...]  list every corpus sample (or the named ones) as upstream reads it`;
+  dump [sample...]  list every corpus sample (or the named ones) as upstream reads it
+  fixtures          have upstream write the test fixtures and list each one back`;
 
 const [command = "help", ...rest] = process.argv.slice(2);
 switch (command) {
@@ -202,6 +219,9 @@ switch (command) {
     break;
   case "dump":
     await dump(rest);
+    break;
+  case "fixtures":
+    await fixtures();
     break;
   default:
     console.log(USAGE);
