@@ -206,7 +206,7 @@ impl Index {
                         .records::<RawBlock>(count.unsigned_abs())
                         .context(index_error::Truncated)?;
                     (
-                        Kind::File(raw.iter().map(block).collect::<Result<_, _>>()?),
+                        Kind::File(raw.iter().filter_map(block).collect::<Result<_, _>>()?),
                         None,
                     )
                 }
@@ -288,22 +288,31 @@ fn read_child_count(r: &mut Reader<'_>) -> Result<usize, IndexError> {
         .context(index_error::Truncated)
 }
 
-fn block(raw: &RawBlock) -> Result<Block, IndexError> {
+/// Converts a stored block, dropping one of zero bytes.
+///
+/// Upstream writes an empty file as a single block on page -1, and its reader
+/// skips a zero-size block without touching the page it names.
+fn block(raw: &RawBlock) -> Option<Result<Block, IndexError>> {
     let (page, offset, size) = (raw.page.get(), raw.offset.get(), raw.size.get());
-    match (
-        u32::try_from(page),
-        u32::try_from(offset),
-        u32::try_from(size),
-    ) {
-        (Ok(page), Ok(offset), Ok(size)) => Ok(Block { page, offset, size }),
-        _ => index_error::NegativeBlock { page, offset, size }.fail(),
+    if size == 0 {
+        return None;
     }
+    Some(
+        match (
+            u32::try_from(page),
+            u32::try_from(offset),
+            u32::try_from(size),
+        ) {
+            (Ok(page), Ok(offset), Ok(size)) => Ok(Block { page, offset, size }),
+            _ => index_error::NegativeBlock { page, offset, size }.fail(),
+        },
+    )
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use assert2::check;
+    use assert2::{assert, check};
 
     /// Builds fsindex blobs entry by entry, in the order they appear on disk.
     #[derive(Default)]
@@ -393,6 +402,15 @@ pub(crate) mod tests {
         }
         let blob = fs.file("f", &[]).finish();
         check!(let Err(IndexError::TooDeep { limit: 3 }) = Index::parse(&blob, 3));
+    }
+
+    #[test]
+    fn a_zero_size_block_on_page_minus_one_is_an_empty_file() {
+        let blob = Fsindex::new(1).file("empty", &[(-1, 0, 0)]).finish();
+        let index = Index::parse(&blob, 8).unwrap();
+        let (_, f) = index.walk()[0].clone();
+        assert!(let Kind::File(blocks) = &index.nodes[f].kind);
+        check!(blocks.is_empty());
     }
 
     #[test]
