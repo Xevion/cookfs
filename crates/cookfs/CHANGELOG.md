@@ -24,6 +24,9 @@
 - Every page, pgindex and fsindex is checked against the MD5 or CRC-32 the archive stores for
   it, failing with `CodecError::HashMismatch`. On by default; `OpenOptions::verify` turns it
   off. Blobs written without a hash are not checked.
+- `Archive::metadata` and `Archive::metadata_entries` read the fsindex's archive-wide records.
+- Fileset archives list their active fileset as the root, as upstream mounts them.
+  `Archive::filesets`, `Archive::fileset` and `Archive::select_fileset` list and switch them.
 
 ### Fixed
 

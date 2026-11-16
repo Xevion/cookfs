@@ -207,10 +207,7 @@ fn trial(sample: Sample, dir: &Path, listings: &Path) -> Trial {
 }
 
 /// Fixtures this crate reads differently from upstream, ignored until fixed, each with the bug it shows.
-const KNOWN_BUGS: &[(&str, &str)] = &[(
-    "v3-fileset",
-    "BUG: a fileset archive lists its fileset directory at the root instead of mounting it there",
-)];
+const KNOWN_BUGS: &[(&str, &str)] = &[];
 
 /// Archives upstream wrote for cases the corpus lacks, each beside upstream's listing of it.
 fn fixtures() -> Vec<Trial> {

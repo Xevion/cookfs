@@ -866,7 +866,11 @@ fn deep_wide(depth: usize, files: u32) -> Vec<u8> {
 fn walk_output_stays_in_proportion_to_the_fsindex() {
     let blob = deep_wide(100, 1000);
     let index = crate::index::Index::parse(&blob, 512).unwrap();
-    let total: usize = index.walk().iter().map(|(path, _)| path.len()).sum();
+    let total: usize = index
+        .walk(index.root)
+        .iter()
+        .map(|(path, _)| path.len())
+        .sum();
     check!(
         total <= 64 * blob.len(),
         "walk produced {total} path bytes from a {}-byte fsindex",
@@ -1059,7 +1063,7 @@ fn a_million_tiny_entries_open_and_walk_in_bounded_time() {
     blob.extend_from_slice(&0u32.to_be_bytes());
     let started = Instant::now();
     let (index, held) = peak(|| crate::index::Index::parse(&blob, 512).unwrap());
-    let walked = index.walk().len();
+    let walked = index.walk(index.root).len();
     check!(walked == 1);
     check!(
         held <= 16 * blob.len(),

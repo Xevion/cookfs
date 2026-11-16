@@ -91,6 +91,12 @@ pub enum Error {
         /// Decoded page bytes consumed when the read stopped.
         decoded: u64,
     },
+    /// No fileset of that name is in the archive.
+    #[snafu(display("archive has no fileset named {name:?}"))]
+    NoSuchFileset {
+        /// The name asked for.
+        name: String,
+    },
     /// A file names a page the archive does not have.
     #[snafu(display("a file names page {page}, but the archive holds {pages}"))]
     PageOutOfRange {

@@ -141,6 +141,10 @@ impl Node {
 pub(crate) struct Index {
     pub(crate) nodes: Arena<Node>,
     pub(crate) root: Idx<Node>,
+    /// The root entry written first, which upstream's directory table lists first.
+    pub(crate) first_at_root: Option<Idx<Node>>,
+    /// Archive-wide key/value records, a repeated key keeping its last value.
+    pub(crate) metadata: Vec<(String, Vec<u8>)>,
 }
 
 /// The fixed fields after an entry's name.
@@ -181,12 +185,18 @@ impl Index {
             kind: Kind::Dir(Vec::new()),
         });
 
+        let mut first_name = None;
         // Each open directory with the count of its children still unread.
         let mut open = vec![(root, read_child_count(&mut r)?)];
         while let Some((dir, left)) = open.last_mut() {
             if *left == 0 {
                 let dir = *dir;
                 open.pop();
+                if dir == root
+                    && let Kind::Dir(children) = &nodes[root].kind
+                {
+                    first_name = children.first().map(|&c| nodes[c].name.clone());
+                }
                 settle(&mut nodes, dir)?;
                 continue;
             }
@@ -235,35 +245,31 @@ impl Index {
             }
         }
 
-        // Archive-wide key/value records follow the tree; consumed here so a
-        // desynchronized parse cannot pass as complete. Archives older than
-        // the metadata section end with the tree.
-        if r.remaining() == 0 {
-            return Ok(Self { nodes, root });
-        }
-        let count = r.record::<U32>().context(index_error::Truncated)?.get();
-        let count = r
-            .check_count(count, size_of::<U32>())
-            .context(index_error::Truncated)?;
-        for _ in 0..count {
-            let len = r.record::<U32>().context(index_error::Truncated)?.get();
-            r.take(len as usize).context(index_error::Truncated)?;
-        }
+        let first_at_root = first_name.and_then(|name| match &nodes[root].kind {
+            Kind::Dir(children) => children.iter().copied().find(|&c| nodes[c].name == name),
+            Kind::File(_) => None,
+        });
 
+        let metadata = read_metadata(&mut r)?;
         ensure!(
             r.remaining() == 0,
             index_error::Trailing {
                 extra: r.remaining()
             }
         );
-        Ok(Self { nodes, root })
+        Ok(Self {
+            nodes,
+            root,
+            first_at_root,
+            metadata,
+        })
     }
 
     /// Every node in pre-order, siblings sorted by name, with its full path.
-    pub(crate) fn walk(&self) -> Vec<(String, Idx<Node>)> {
+    pub(crate) fn walk(&self, root: Idx<Node>) -> Vec<(String, Idx<Node>)> {
         let mut out = Vec::new();
         let mut pending = Vec::new();
-        self.queue_children(self.root, "", &mut pending);
+        self.queue_children(root, "", &mut pending);
         while let Some((idx, path)) = pending.pop() {
             self.queue_children(idx, &path, &mut pending);
             out.push((path, idx));
@@ -315,6 +321,33 @@ fn settle(nodes: &mut Arena<Node>, dir: Idx<Node>) -> Result<(), IndexError> {
     }
     nodes[dir].kind = Kind::Dir(kept);
     Ok(())
+}
+
+/// Reads the archive-wide key/value records after the tree, which archives older than the section lack.
+fn read_metadata(r: &mut Reader<'_>) -> Result<Vec<(String, Vec<u8>)>, IndexError> {
+    let mut metadata: Vec<(String, Vec<u8>)> = Vec::new();
+    if r.remaining() == 0 {
+        return Ok(metadata);
+    }
+    let count = r.record::<U32>().context(index_error::Truncated)?.get();
+    let count = r
+        .check_count(count, size_of::<U32>())
+        .context(index_error::Truncated)?;
+    for _ in 0..count {
+        let len = r.record::<U32>().context(index_error::Truncated)?.get();
+        let record = r.take(len as usize).context(index_error::Truncated)?;
+        // `key NUL value`; a record without its NUL is a key with no value.
+        let (key, value) = record
+            .iter()
+            .position(|&b| b == 0)
+            .map_or((record, &[][..]), |at| (&record[..at], &record[at + 1..]));
+        let key = crate::name::decode(key);
+        match metadata.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, slot)) => *slot = value.to_vec(),
+            None => metadata.push((key, value.to_vec())),
+        }
+    }
+    Ok(metadata)
 }
 
 fn read_child_count(r: &mut Reader<'_>) -> Result<usize, IndexError> {
@@ -389,14 +422,29 @@ pub(crate) mod tests {
             self
         }
 
-        pub(crate) fn finish(mut self) -> Vec<u8> {
-            self.body.extend_from_slice(&0u32.to_be_bytes());
+        pub(crate) fn finish(self) -> Vec<u8> {
+            self.finish_with(&[])
+        }
+
+        /// Ends the tree with these raw metadata records.
+        pub(crate) fn finish_with(mut self, records: &[&[u8]]) -> Vec<u8> {
+            self.body
+                .extend_from_slice(&(records.len() as u32).to_be_bytes());
+            for record in records {
+                self.body
+                    .extend_from_slice(&(record.len() as u32).to_be_bytes());
+                self.body.extend_from_slice(record);
+            }
             self.body
         }
     }
 
     fn paths(index: &Index) -> Vec<String> {
-        index.walk().into_iter().map(|(path, _)| path).collect()
+        index
+            .walk(index.root)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
     }
 
     #[test]
@@ -425,7 +473,7 @@ pub(crate) mod tests {
     fn a_file_sums_its_blocks() {
         let blob = Fsindex::new(1).file("f", &[(0, 0, 3), (1, 0, 4)]).finish();
         let index = Index::parse(&blob, 8).unwrap();
-        let (_, f) = index.walk()[0].clone();
+        let (_, f) = index.walk(index.root)[0].clone();
         check!(index.nodes[f].size() == 7);
     }
 
@@ -443,7 +491,7 @@ pub(crate) mod tests {
     fn a_zero_size_block_on_page_minus_one_is_an_empty_file() {
         let blob = Fsindex::new(1).file("empty", &[(-1, 0, 0)]).finish();
         let index = Index::parse(&blob, 8).unwrap();
-        let (_, f) = index.walk()[0].clone();
+        let (_, f) = index.walk(index.root)[0].clone();
         assert!(let Kind::File(blocks) = &index.nodes[f].kind);
         check!(blocks.is_empty());
     }
@@ -474,7 +522,7 @@ pub(crate) mod tests {
             .file("f", &[(0, 0, 2)])
             .finish();
         let index = Index::parse(&blob, 8).unwrap();
-        let walked = index.walk();
+        let walked = index.walk(index.root);
         check!(walked.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>() == ["f", "g"]);
         check!(index.nodes[walked[0].1].size() == 2);
     }
@@ -502,6 +550,18 @@ pub(crate) mod tests {
         let mut blob = Fsindex::new(1).file("f", &[]).finish();
         blob.truncate(blob.len() - 4);
         check!(paths(&Index::parse(&blob, 8).unwrap()) == ["f"]);
+    }
+
+    #[test]
+    fn metadata_records_split_at_their_first_nul_and_a_repeated_key_keeps_its_last_value() {
+        let blob = Fsindex::new(0).finish_with(&[b"a\0one", b"b\0x\0y", b"bare", b"a\0two"]);
+        let index = Index::parse(&blob, 8).unwrap();
+        let got: Vec<(&str, &[u8])> = index
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        check!(got == [("a", &b"two"[..]), ("b", b"x\0y"), ("bare", b"")]);
     }
 
     #[test]

@@ -115,6 +115,8 @@ pub struct Archive<R> {
     limits: Limits,
     verify: bool,
     encryption: Option<Encryption>,
+    /// The fileset directory standing in for the root, when the archive has filesets.
+    fileset: Option<Idx<Node>>,
 }
 
 impl<R: ReadAt + Size> Archive<R> {
@@ -178,6 +180,7 @@ impl<R: ReadAt + Size> Archive<R> {
         let workers = std::thread::available_parallelism()
             .map_or(WORKERS_FALLBACK, std::num::NonZeroUsize::get);
 
+        let fileset = default_fileset(&index);
         Ok(Self {
             src,
             version,
@@ -187,6 +190,7 @@ impl<R: ReadAt + Size> Archive<R> {
             limits,
             verify: opts.verify,
             encryption: layout.encryption,
+            fileset,
         })
     }
 
@@ -275,9 +279,94 @@ impl<R: ReadAt + Size> Archive<R> {
     }
 
     /// Every node in pre-order, siblings sorted by name, with its full path.
+    ///
+    /// Paths are relative to the active fileset when the archive has one.
     pub fn walk(&self) -> Vec<(String, Idx<Node>)> {
-        self.index.walk()
+        self.index.walk(self.fileset.unwrap_or(self.index.root))
     }
+
+    /// The value the fsindex records for an archive-wide metadata `key`.
+    #[must_use]
+    pub fn metadata(&self, key: &str) -> Option<&[u8]> {
+        self.index
+            .metadata
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Every metadata key and its value, in the order the archive first wrote them.
+    pub fn metadata_entries(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.index
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+    }
+
+    /// The filesets the archive holds, sorted, or none when it was not written with filesets.
+    ///
+    /// A fileset archive keeps one directory per fileset at its root and names
+    /// how one is chosen under the `cookfs.fileset` metadata key.
+    #[must_use]
+    pub fn filesets(&self) -> Vec<&str> {
+        if self.metadata(FILESET_KEY).is_none() {
+            return Vec::new();
+        }
+        match &self.index.nodes[self.index.root].kind {
+            Kind::Dir(children) => children
+                .iter()
+                .map(|&c| &self.index.nodes[c])
+                .filter(|n| n.is_dir())
+                .map(|n| n.name.as_str())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The fileset [`Self::walk`] lists, if the archive has filesets.
+    ///
+    /// Upstream picks one by its own Tcl version and platform unless the
+    /// archive names a custom fileset, when it takes the first written. With
+    /// no Tcl runtime to match, this reader always starts at the first written;
+    /// [`Self::select_fileset`] picks another.
+    #[must_use]
+    pub fn fileset(&self) -> Option<&str> {
+        self.fileset.map(|idx| self.index.nodes[idx].name.as_str())
+    }
+
+    /// Makes the fileset `name` the one [`Self::walk`] lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoSuchFileset`] unless `name` is one of [`Self::filesets`].
+    pub fn select_fileset(&mut self, name: &str) -> Result<()> {
+        let found = match &self.index.nodes[self.index.root].kind {
+            Kind::Dir(children) => children.iter().copied().find(|&c| {
+                let node = &self.index.nodes[c];
+                node.is_dir() && node.name == name
+            }),
+            _ => None,
+        };
+        self.fileset = Some(
+            found
+                .filter(|_| self.metadata(FILESET_KEY).is_some())
+                .context(ctx::NoSuchFileset {
+                    name: name.to_owned(),
+                })?,
+        );
+        Ok(())
+    }
+}
+
+/// The metadata key a fileset archive records how its fileset is chosen under.
+const FILESET_KEY: &str = "cookfs.fileset";
+
+/// The fileset upstream activates when it cannot match one to its runtime: the first root entry written.
+fn default_fileset(index: &Index) -> Option<Idx<Node>> {
+    let has_filesets = index.metadata.iter().any(|(k, _)| k == FILESET_KEY);
+    index
+        .first_at_root
+        .filter(|&idx| has_filesets && index.nodes[idx].is_dir())
 }
 
 /// Full opens tried on candidates that pass the cheap check, before the rightmost one's error is reported.
@@ -613,6 +702,47 @@ mod tests {
             caught += usize::from(read_all(buf).is_err());
         }
         check!(caught == (tail - STAMP).div_ceil(97));
+    }
+
+    /// Two filesets at the root; the first written is active, as upstream activates a custom one.
+    fn two_filesets() -> Archive<Vec<u8>> {
+        let fsindex = Fsindex::new(2)
+            .dir("zeta", 1)
+            .file("z.txt", &[(0, 0, 1)])
+            .dir("alpha", 1)
+            .file("a.txt", &[(0, 1, 1)])
+            .finish_with(&[b"cookfs.fileset\0custom"]);
+        let buf = cfs0003::tests::archive(&[b"za".to_vec()], &fsindex, 0x78);
+        open(buf).unwrap()
+    }
+
+    #[test]
+    fn a_fileset_archive_lists_the_first_written_fileset_as_its_root() {
+        let archive = two_filesets();
+        check!(archive.filesets() == ["alpha", "zeta"]);
+        check!(archive.fileset() == Some("zeta"));
+        let walked: Vec<String> = archive.walk().into_iter().map(|(p, _)| p).collect();
+        check!(walked == ["z.txt"]);
+        check!(archive.metadata("cookfs.fileset") == Some(&b"custom"[..]));
+    }
+
+    #[test]
+    fn another_fileset_can_be_selected_and_a_missing_one_is_refused() {
+        let mut archive = two_filesets();
+        archive.select_fileset("alpha").unwrap();
+        let (path, idx) = archive.walk().into_iter().next().unwrap();
+        check!(path == "a.txt");
+        check!(archive.read(idx).unwrap() == b"a");
+        check!(let Err(Error::NoSuchFileset { .. }) = archive.select_fileset("beta"));
+        check!(archive.fileset() == Some("alpha"));
+    }
+
+    #[test]
+    fn without_fileset_metadata_root_directories_are_plain_directories() {
+        let fsindex = Fsindex::new(1).dir("alpha", 0).finish();
+        let archive = open(cfs0003::tests::archive(&[], &fsindex, 0x78)).unwrap();
+        check!(archive.filesets().is_empty());
+        check!(archive.fileset().is_none());
     }
 
     /// A stray all-zero trailer before a damaged archive once opened as an empty one.
