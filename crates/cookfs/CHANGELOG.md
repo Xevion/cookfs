@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking
+
+- `Archive::open` takes `&OpenOptions`, and `open_with` is gone. Size ceilings live in
+  `Limits`, which adds a page-size and a directory-depth ceiling to the fsindex one.
+- `Codec` is replaced by `Compression`, which keeps an unknown id's number instead of
+  failing to parse it.
+- `Archive::encryption` returns an `Encryption` with a typed mode and level instead of the
+  raw byte.
+- Errors are split per layer (`SourceError`, `TrailerError`, `IndexError`, `CodecError`),
+  with `Error` wrapping them.
+- `Block` fields are unsigned.
+
+### Fixed
+
+- A negative block field, or a block naming a page the archive lacks, is refused at open
+  instead of at read.
+- A block running past its page is an error instead of a silently short read.
+- A decoded page or index that disagrees with its declared size is an error.
+- An encrypted `CFS0003` archive is refused instead of read as garbage.
+- A deeply nested fsindex can no longer overflow the stack.
+
 ## 0.1.0 (2026-08-24)
 
 

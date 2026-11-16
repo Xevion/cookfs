@@ -1,225 +1,216 @@
-//! Codec dispatch for page and fsindex blobs.
-//!
-//! Every blob a CFS0002 archive stores, whether a page or the fsindex itself,
-//! opens with a 1-byte codec id naming how the rest of the blob is compressed.
+//! Decompression of page, pgindex and fsindex blobs.
 
 use std::io::Read;
 
-use snafu::{OptionExt, ResultExt};
+use snafu::{ResultExt, Snafu, ensure};
 
-use crate::read::{
-    CodecUnavailableSnafu, DecompressBombSnafu, DecompressSnafu, EmptyBlobSnafu, Result,
-    UnknownCodecSnafu,
-};
+use crate::wire::Compression;
 
-/// Reads a decoder to end, but errors instead of silently truncating past `limit`.
-///
-/// `.take(limit)` alone would stop reading at the ceiling and return the
-/// truncated output as if it had decompressed cleanly, which lets a
-/// decompression bomb sneak past as a legitimate result. Taking `limit + 1`
-/// and refusing anything over `limit` turns the cap into a hard error.
-fn read_bounded<R: Read>(reader: R, limit: usize, codec: &'static str) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    reader
-        .take((limit as u64).saturating_add(1))
-        .read_to_end(&mut out)
-        .context(DecompressSnafu { codec })?;
-    if out.len() > limit {
-        return DecompressBombSnafu { codec, limit }.fail();
+/// A blob that could not be decoded.
+#[derive(Debug, Snafu)]
+#[snafu(module, context(suffix(false)), visibility(pub(crate)))]
+pub enum CodecError {
+    /// The id names no codec this crate knows.
+    #[snafu(display("unknown compression id {}", id.raw()))]
+    Unknown {
+        /// The id as read.
+        id: Compression,
+    },
+    /// The codec is known but cannot be decoded by this build.
+    #[snafu(display("{id} decoding is not available: {why}"))]
+    Unavailable {
+        /// The codec.
+        id: Compression,
+        /// What would make it available.
+        why: &'static str,
+    },
+    /// A `CFS0002` blob had no leading id byte.
+    #[snafu(display("blob is empty, so it has no compression id"))]
+    Empty,
+    /// The codec rejected the payload.
+    #[snafu(display("{id} payload failed to decode"))]
+    Decompress {
+        /// The codec.
+        id: Compression,
+        /// The decoder's failure.
+        source: std::io::Error,
+    },
+    /// The output would exceed its declared size or the configured limit.
+    #[snafu(display("{id} output exceeds {limit} bytes"))]
+    TooLarge {
+        /// The codec.
+        id: Compression,
+        /// The ceiling that was hit.
+        limit: usize,
+    },
+    /// The output stopped short of the size the archive declared for it.
+    #[snafu(display("{id} output is {got} bytes, the archive declares {want}"))]
+    Short {
+        /// The codec.
+        id: Compression,
+        /// The declared size.
+        want: usize,
+        /// The size actually produced.
+        got: usize,
+    },
+    /// Raw LZMA1 has no end marker, so it cannot be decoded without a declared size.
+    #[snafu(display("{id} blob has no declared size to stop at"))]
+    Unbounded {
+        /// The codec.
+        id: Compression,
+    },
+}
+
+const _: () = assert!(size_of::<CodecError>() <= 64);
+
+/// How large a decoded blob may be.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Expect {
+    /// The size the archive records for the decoded blob, when it records one.
+    pub(crate) declared: Option<usize>,
+    /// The configured ceiling, applied whether or not a size is declared.
+    pub(crate) limit: usize,
+}
+
+/// Decodes a `CFS0002` blob, whose first byte names its codec.
+pub(crate) fn decode_prefixed(blob: &[u8], expect: Expect) -> Result<Vec<u8>, CodecError> {
+    let (&id, body) = blob.split_first().ok_or(CodecError::Empty)?;
+    decode(Compression::from_raw(id), body, expect)
+}
+
+/// Decodes a payload whose codec is named out of band.
+pub(crate) fn decode(id: Compression, body: &[u8], expect: Expect) -> Result<Vec<u8>, CodecError> {
+    let ceiling = match expect.declared {
+        Some(declared) => {
+            ensure!(
+                declared <= expect.limit,
+                codec_error::TooLarge {
+                    id,
+                    limit: expect.limit
+                }
+            );
+            declared
+        }
+        None => expect.limit,
+    };
+
+    let out = match id {
+        Compression::NONE => {
+            ensure!(
+                body.len() <= ceiling,
+                codec_error::TooLarge { id, limit: ceiling }
+            );
+            body.to_vec()
+        }
+        Compression::ZLIB => bounded(id, flate2::read::DeflateDecoder::new(body), ceiling)?,
+        Compression::LZMA => {
+            let declared = expect.declared.ok_or(CodecError::Unbounded { id })?;
+            raw_lzma1(id, body, declared)?
+        }
+        Compression::LEGACY_CUSTOM => lzma_alone(id, body, ceiling)?,
+        Compression::BZIP2 => bzip2(id, body, ceiling)?,
+        Compression::ZSTD => zstd(id, body, ceiling)?,
+        Compression::BROTLI => brotli(id, body, ceiling)?,
+        Compression::CUSTOM => {
+            return codec_error::Unavailable {
+                id,
+                why: "it is a Tcl callback slot",
+            }
+            .fail();
+        }
+        id => return codec_error::Unknown { id }.fail(),
+    };
+
+    if let Some(want) = expect.declared {
+        ensure!(
+            out.len() == want,
+            codec_error::Short {
+                id,
+                want,
+                got: out.len()
+            }
+        );
     }
     Ok(out)
 }
 
-/// A compression codec named by a blob's leading id byte.
+/// Reads a decoder to its end, failing rather than truncating past `limit`.
 ///
-/// Every id a CFS0002 archive is known to emit is represented here, even ids
-/// this build cannot decode: [`Codec::from_id`] should never fail on a real
-/// archive, only `decode` should, and only for the codecs not yet wired up.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Codec {
-    /// Uncompressed passthrough (id 0).
-    Stored,
-    /// zlib/deflate (id 1).
-    Deflate,
-    /// bzip2 (id 2). Requires the `codec-bzip2` feature, on by default.
-    Bzip2,
-    /// Raw LZMA1 (id 3): `CFS0003`'s own codec, distinct from BitRock's
-    /// `.lzma`-alone container at id 255 despite sharing an algorithm.
-    Lzma,
-    /// Zstandard (id 4). Requires the `codec-zstd` feature, on by default.
-    Zstd,
-    /// Brotli (id 5). Requires the `codec-brotli` feature, on by default.
-    Brotli,
-    /// BitRock's legacy LZMA-alone codec, wired into the custom slot (id 255).
-    LegacyCustom,
-    /// The modern custom codec slot (id 254).
-    ///
-    /// Support would require a caller-supplied decoder; no such extension
-    /// point is exposed yet, so this variant always decodes as unavailable.
-    ModernCustom,
+/// `take(limit)` alone stops at the ceiling and reports the truncated output
+/// as clean, which lets an oversized stream through. Taking one byte more and
+/// refusing it turns the ceiling into an error.
+fn bounded(id: Compression, reader: impl Read, limit: usize) -> Result<Vec<u8>, CodecError> {
+    let mut out = Vec::new();
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut out)
+        .context(codec_error::Decompress { id })?;
+    ensure!(out.len() <= limit, codec_error::TooLarge { id, limit });
+    Ok(out)
 }
 
-impl Codec {
-    /// Maps a blob's wire codec id to its variant.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::UnknownCodec`] for any id outside the known set.
-    pub fn from_id(id: u8) -> Result<Self> {
-        match id {
-            0 => Ok(Self::Stored),
-            1 => Ok(Self::Deflate),
-            2 => Ok(Self::Bzip2),
-            3 => Ok(Self::Lzma),
-            4 => Ok(Self::Zstd),
-            5 => Ok(Self::Brotli),
-            254 => Ok(Self::ModernCustom),
-            255 => Ok(Self::LegacyCustom),
-            id => UnknownCodecSnafu { id }.fail(),
-        }
-    }
-
-    /// The wire id this variant was decoded from.
-    #[must_use]
-    pub fn id(self) -> u8 {
-        match self {
-            Self::Stored => 0,
-            Self::Deflate => 1,
-            Self::Bzip2 => 2,
-            Self::Lzma => 3,
-            Self::Zstd => 4,
-            Self::Brotli => 5,
-            Self::ModernCustom => 254,
-            Self::LegacyCustom => 255,
-        }
-    }
+#[cfg(feature = "codec-bzip2")]
+fn bzip2(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
+    bounded(id, bzip2::read::BzDecoder::new(body), limit)
 }
 
-/// Decodes one blob: a leading 1-byte codec id, then the compressed payload.
-///
-/// `uncompressed_len` is the blob's own declared decompressed size. Every
-/// codec's read is bounded to this length so a decompression bomb from
-/// untrusted input cannot exhaust memory, and [`Codec::Lzma`] additionally
-/// relies on it as the termination signal a raw LZMA1 stream lacks.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::EmptyBlob`] for a zero-length blob,
-/// [`crate::Error::UnknownCodec`] for an id outside the known set,
-/// [`crate::Error::CodecUnavailable`] for a known id this build cannot decode,
-/// and [`crate::Error::Decompress`] if a codec's decoder rejects the payload.
-pub(crate) fn decode(blob: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    let (&id, body) = blob.split_first().context(EmptyBlobSnafu)?;
-    decode_with(Codec::from_id(id)?, body, uncompressed_len)
-}
-
-/// Decodes a payload whose codec is already known, with no leading id byte.
-///
-/// `CFS0003` names each page's codec out of band, in the pgindex table, so
-/// its page and index blobs carry no leading id byte for [`decode`] to strip.
-/// `uncompressed_len` is the blob's own declared decompressed size. Every
-/// codec's read is bounded to this length so a decompression bomb from
-/// untrusted input cannot exhaust memory, and [`Codec::Lzma`] additionally
-/// relies on it as the termination signal a raw LZMA1 stream lacks.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::CodecUnavailable`] for a known id this build
-/// cannot decode, and [`crate::Error::Decompress`] if the codec's decoder
-/// rejects the payload.
-pub(crate) fn decode_with(codec: Codec, body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    match codec {
-        Codec::Stored => Ok(body.to_vec()),
-        Codec::Deflate => decode_deflate(body, uncompressed_len),
-        Codec::Lzma => decode_raw_lzma1(body, uncompressed_len),
-        Codec::LegacyCustom => decode_lzma_alone(body, uncompressed_len),
-        #[cfg(feature = "codec-bzip2")]
-        Codec::Bzip2 => decode_bzip2(body, uncompressed_len),
-        #[cfg(not(feature = "codec-bzip2"))]
-        codec @ Codec::Bzip2 => unavailable(codec, "bzip2"),
-        #[cfg(feature = "codec-zstd")]
-        Codec::Zstd => decode_zstd(body, uncompressed_len),
-        #[cfg(not(feature = "codec-zstd"))]
-        codec @ Codec::Zstd => unavailable(codec, "zstd"),
-        #[cfg(feature = "codec-brotli")]
-        Codec::Brotli => decode_brotli(body, uncompressed_len),
-        #[cfg(not(feature = "codec-brotli"))]
-        codec @ Codec::Brotli => unavailable(codec, "brotli"),
-        codec @ Codec::ModernCustom => unavailable(codec, "modern-custom"),
-    }
-}
-
-fn unavailable(codec: Codec, feature: &'static str) -> Result<Vec<u8>> {
-    CodecUnavailableSnafu {
-        id: codec.id(),
-        feature,
+#[cfg(not(feature = "codec-bzip2"))]
+fn bzip2(id: Compression, _: &[u8], _: usize) -> Result<Vec<u8>, CodecError> {
+    codec_error::Unavailable {
+        id,
+        why: "the `codec-bzip2` feature is off",
     }
     .fail()
 }
 
-/// The read is bounded to `uncompressed_len` so a decompression bomb from
-/// untrusted input cannot exhaust memory even when the codec reports its own
-/// end-of-stream cleanly.
-fn decode_deflate(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    read_bounded(
-        flate2::read::DeflateDecoder::new(body),
-        uncompressed_len,
-        "deflate",
-    )
-}
-
-#[cfg(feature = "codec-bzip2")]
-fn decode_bzip2(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    read_bounded(bzip2::read::BzDecoder::new(body), uncompressed_len, "bzip2")
-}
-
 #[cfg(feature = "codec-zstd")]
-fn decode_zstd(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    let decoder =
-        zstd::stream::read::Decoder::new(body).context(DecompressSnafu { codec: "zstd" })?;
-    read_bounded(decoder, uncompressed_len, "zstd")
+fn zstd(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
+    let decoder = zstd::stream::read::Decoder::new(body).context(codec_error::Decompress { id })?;
+    bounded(id, decoder, limit)
+}
+
+#[cfg(not(feature = "codec-zstd"))]
+fn zstd(id: Compression, _: &[u8], _: usize) -> Result<Vec<u8>, CodecError> {
+    codec_error::Unavailable {
+        id,
+        why: "the `codec-zstd` feature is off",
+    }
+    .fail()
 }
 
 #[cfg(feature = "codec-brotli")]
-fn decode_brotli(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
-    const BUFFER_SIZE: usize = 4096;
-    read_bounded(
-        brotli::Decompressor::new(body, BUFFER_SIZE),
-        uncompressed_len,
-        "brotli",
-    )
+fn brotli(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
+    const BUFFER: usize = 4096;
+    bounded(id, brotli::Decompressor::new(body, BUFFER), limit)
 }
 
-/// BitRock's legacy custom slot (id 255): the classic `.lzma`-alone
-/// container, a 13-byte header (properties, dictionary size, uncompressed
-/// size) that `liblzma`'s alone decoder consumes itself.
-fn decode_lzma_alone(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+#[cfg(not(feature = "codec-brotli"))]
+fn brotli(id: Compression, _: &[u8], _: usize) -> Result<Vec<u8>, CodecError> {
+    codec_error::Unavailable {
+        id,
+        why: "the `codec-brotli` feature is off",
+    }
+    .fail()
+}
+
+/// BitRock's legacy custom slot: a classic `.lzma`-alone stream, whose 13-byte header the decoder reads itself.
+fn lzma_alone(id: Compression, body: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
     let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX)
         .map_err(std::io::Error::other)
-        .context(DecompressSnafu { codec: "lzma" })?;
-    read_bounded(
+        .context(codec_error::Decompress { id })?;
+    bounded(
+        id,
         liblzma::read::XzDecoder::new_stream(body, stream),
-        uncompressed_len,
-        "lzma",
+        limit,
     )
 }
 
-/// `CFS0003`'s id-3 LZMA blobs (pages, pgindex, fsindex) are raw LZMA1
-/// streams, not the classic `.lzma`-alone container: a 5-byte properties
-/// header (1 properties byte, 4-byte little-endian dictionary size) with no
-/// uncompressed-size field and no end-of-stream marker.
+/// `CFS0003`'s raw LZMA1: a properties byte and a little-endian dictionary size, then a stream with no end marker.
 ///
-/// With no end marker, `liblzma`'s decoder never reports [`Status::StreamEnd`]
-/// and its `Read` wrapper errors the moment input runs out. The take-count
-/// is the reader's *only* termination signal, not a bomb guard: it must be
-/// exactly `uncompressed_len`, so [`read_bounded`]'s `limit + 1` trick would
-/// invoke the decoder past its natural stop and fail on missing input.
-/// A crafted, lying `uncompressed_len` is still bounded by 4 GiB in `u32`;
-/// downstream parsing catches a truncated blob.
-///
-/// [`Status::StreamEnd`]: liblzma::stream::Status::StreamEnd
-fn decode_raw_lzma1(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+/// Without an end marker the decoder never reports a clean end and errors once
+/// input runs out, so the declared size is the only place to stop. Reading one
+/// byte past it, as [`bounded`] does, would run the decoder into that error.
+fn raw_lzma1(id: Compression, body: &[u8], declared: usize) -> Result<Vec<u8>, CodecError> {
     const HEADER_LEN: usize = 5;
     let (header, payload) = body.split_at(HEADER_LEN.min(body.len()));
 
@@ -227,16 +218,16 @@ fn decode_raw_lzma1(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
     filters
         .lzma1_properties(header)
         .map_err(std::io::Error::other)
-        .context(DecompressSnafu { codec: "lzma" })?;
-
+        .context(codec_error::Decompress { id })?;
     let stream = liblzma::stream::Stream::new_raw_decoder(&filters)
         .map_err(std::io::Error::other)
-        .context(DecompressSnafu { codec: "lzma" })?;
+        .context(codec_error::Decompress { id })?;
+
     let mut out = Vec::new();
     liblzma::read::XzDecoder::new_stream(payload, stream)
-        .take(uncompressed_len as u64)
+        .take(declared as u64)
         .read_to_end(&mut out)
-        .context(DecompressSnafu { codec: "lzma" })?;
+        .context(codec_error::Decompress { id })?;
     Ok(out)
 }
 
@@ -244,75 +235,38 @@ fn decode_raw_lzma1(body: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use assert2::check;
-    #[cfg(any(feature = "codec-zstd", feature = "codec-brotli"))]
+    use rstest::rstest;
     use std::io::Write;
 
-    #[test]
-    fn from_id_maps_every_known_id_to_its_variant() {
-        let cases = [
-            (0u8, Codec::Stored),
-            (1, Codec::Deflate),
-            (2, Codec::Bzip2),
-            (3, Codec::Lzma),
-            (4, Codec::Zstd),
-            (5, Codec::Brotli),
-            (254, Codec::ModernCustom),
-            (255, Codec::LegacyCustom),
-        ];
-        for (id, expected) in cases {
-            check!(Codec::from_id(id).unwrap() == expected);
-            check!(expected.id() == id);
+    const TEXT: &[u8] = b"the quick brown fox jumps over the lazy dog";
+
+    fn exact(len: usize) -> Expect {
+        Expect {
+            declared: Some(len),
+            limit: usize::MAX,
         }
     }
 
-    #[test]
-    fn from_id_rejects_unknown_ids() {
-        for id in [6u8, 100, 200, 253] {
-            let err = Codec::from_id(id).unwrap_err();
-            check!(matches!(err, crate::Error::UnknownCodec { id: got } if got == id));
-        }
+    fn deflate(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        flate2::read::DeflateEncoder::new(payload, flate2::Compression::default())
+            .read_to_end(&mut out)
+            .unwrap();
+        out
     }
 
-    #[test]
-    fn decode_of_stored_is_identity() {
-        let mut blob = vec![0u8];
-        blob.extend_from_slice(b"payload bytes");
-        check!(decode(&blob, 13).unwrap() == b"payload bytes");
-    }
-
-    #[test]
-    fn decode_of_deflate_round_trips_a_known_stream() {
-        let mut compressed = Vec::new();
-        flate2::read::DeflateEncoder::new(
-            &b"the quick brown fox jumps over the lazy dog"[..],
-            flate2::Compression::default(),
-        )
-        .read_to_end(&mut compressed)
-        .unwrap();
-
-        let mut blob = vec![1u8];
-        blob.extend_from_slice(&compressed);
-        check!(decode(&blob, 44).unwrap() == b"the quick brown fox jumps over the lazy dog");
-    }
-
-    #[test]
-    fn decode_of_legacy_custom_round_trips_a_known_stream() {
+    fn lzma_alone_stream(payload: &[u8]) -> Vec<u8> {
         let options = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
         let stream = liblzma::stream::Stream::new_lzma_encoder(&options).unwrap();
-        let mut compressed = Vec::new();
-        liblzma::read::XzEncoder::new_stream(&b"legacy lzma payload"[..], stream)
-            .read_to_end(&mut compressed)
+        let mut out = Vec::new();
+        liblzma::read::XzEncoder::new_stream(payload, stream)
+            .read_to_end(&mut out)
             .unwrap();
-
-        let mut blob = vec![255u8];
-        blob.extend_from_slice(&compressed);
-        check!(decode(&blob, 19).unwrap() == b"legacy lzma payload");
+        out
     }
 
-    /// Builds a raw LZMA1 blob in the same 5-byte-header shape id 3 uses in
-    /// real `CFS0003` archives: 1 properties byte, 4-byte little-endian
-    /// dictionary size, then a raw stream with no size field or end marker.
-    fn raw_lzma1(payload: &[u8]) -> Vec<u8> {
+    /// The 5-byte-header raw LZMA1 shape `CFS0003` writes for id 3.
+    fn raw_lzma1_stream(payload: &[u8]) -> Vec<u8> {
         let mut opts = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
         let dict_size = 1u32 << 16;
         opts.dict_size(dict_size);
@@ -323,163 +277,123 @@ mod tests {
         liblzma::read::XzEncoder::new_stream(payload, stream)
             .read_to_end(&mut compressed)
             .unwrap();
+        let mut out = vec![0x5Du8]; // lc=3, lp=0, pb=2: the preset's defaults
+        out.extend_from_slice(&dict_size.to_le_bytes());
+        out.extend_from_slice(&compressed);
+        out
+    }
 
-        let mut blob = vec![0x5Du8]; // lc=3, lp=0, pb=2: the preset's defaults
-        blob.extend_from_slice(&dict_size.to_le_bytes());
-        blob.extend_from_slice(&compressed);
-        blob
+    #[cfg(feature = "codec-bzip2")]
+    fn bzip2_stream(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        bzip2::read::BzEncoder::new(payload, bzip2::Compression::default())
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    #[cfg(feature = "codec-zstd")]
+    fn zstd_stream(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[cfg(feature = "codec-brotli")]
+    fn brotli_stream(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 9, 22);
+        encoder.write_all(payload).unwrap();
+        encoder.into_inner()
+    }
+
+    #[rstest]
+    #[case::none(Compression::NONE, TEXT.to_vec())]
+    #[case::zlib(Compression::ZLIB, deflate(TEXT))]
+    #[case::lzma(Compression::LZMA, raw_lzma1_stream(TEXT))]
+    #[case::legacy_custom(Compression::LEGACY_CUSTOM, lzma_alone_stream(TEXT))]
+    #[cfg_attr(
+        feature = "codec-bzip2",
+        case::bzip2(Compression::BZIP2, bzip2_stream(TEXT))
+    )]
+    #[cfg_attr(
+        feature = "codec-zstd",
+        case::zstd(Compression::ZSTD, zstd_stream(TEXT))
+    )]
+    #[cfg_attr(
+        feature = "codec-brotli",
+        case::brotli(Compression::BROTLI, brotli_stream(TEXT))
+    )]
+    fn each_codec_decodes_a_stream_its_reference_encoder_wrote(
+        #[case] id: Compression,
+        #[case] body: Vec<u8>,
+    ) {
+        check!(decode(id, &body, exact(TEXT.len())).unwrap() == TEXT);
     }
 
     #[test]
-    fn decode_of_lzma_round_trips_a_known_stream() {
-        let compressed = raw_lzma1(b"lzma payload");
-        let mut blob = vec![3u8];
-        blob.extend_from_slice(&compressed);
-        check!(decode(&blob, 12).unwrap() == b"lzma payload");
+    fn a_prefixed_blob_names_its_codec_in_its_first_byte() {
+        let mut blob = vec![1u8];
+        blob.extend_from_slice(&deflate(TEXT));
+        check!(decode_prefixed(&blob, exact(TEXT.len())).unwrap() == TEXT);
     }
 
+    /// The decoder's internal buffer boundary falls inside a large payload,
+    /// which only the declared-size stop gets past.
     #[test]
-    fn decode_with_lzma_round_trips_without_a_leading_byte() {
-        let compressed = raw_lzma1(b"externally-coded payload");
-        check!(decode_with(Codec::Lzma, &compressed, 25).unwrap() == b"externally-coded payload");
-    }
-
-    /// A raw LZMA1 stream has no end-of-stream marker: without bounding the
-    /// read to the blob's own declared size, `liblzma`'s `Read` wrapper hits
-    /// its internal buffer boundary partway through a large payload and
-    /// errors instead of reporting completion. Small payloads that fit in
-    /// one internal read don't exercise this path.
-    #[test]
-    fn decode_of_lzma_round_trips_a_stream_larger_than_one_internal_buffer() {
+    fn raw_lzma1_decodes_past_one_internal_buffer() {
         let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let compressed = raw_lzma1(&payload);
-        check!(decode_with(Codec::Lzma, &compressed, payload.len()).unwrap() == payload);
+        let body = raw_lzma1_stream(&payload);
+        check!(decode(Compression::LZMA, &body, exact(payload.len())).unwrap() == payload);
     }
 
     #[test]
-    fn decode_with_stored_is_identity() {
-        check!(decode_with(Codec::Stored, b"payload bytes", 13).unwrap() == b"payload bytes");
+    fn raw_lzma1_without_a_declared_size_is_refused() {
+        let body = raw_lzma1_stream(TEXT);
+        let expect = Expect {
+            declared: None,
+            limit: 1 << 20,
+        };
+        check!(let Err(CodecError::Unbounded { .. }) = decode(Compression::LZMA, &body, expect));
     }
 
     #[test]
-    fn decode_of_modern_custom_reports_unavailable() {
-        let blob = vec![254u8, 0, 1, 2, 3];
-        let err = decode(&blob, 3).unwrap_err();
-        check!(matches!(
-            err,
-            crate::Error::CodecUnavailable { id: 254, .. }
-        ));
-    }
-
-    #[cfg(feature = "codec-bzip2")]
-    #[test]
-    fn decode_of_bzip2_round_trips_a_known_stream() {
-        let mut compressed = Vec::new();
-        bzip2::read::BzEncoder::new(
-            &b"the quick brown fox jumps over the lazy dog"[..],
-            bzip2::Compression::default(),
-        )
-        .read_to_end(&mut compressed)
-        .unwrap();
-
-        let mut blob = vec![2u8];
-        blob.extend_from_slice(&compressed);
-        check!(decode(&blob, 44).unwrap() == b"the quick brown fox jumps over the lazy dog");
-    }
-
-    #[cfg(feature = "codec-bzip2")]
-    #[test]
-    fn decode_with_bzip2_round_trips_without_a_leading_byte() {
-        let mut compressed = Vec::new();
-        bzip2::read::BzEncoder::new(
-            &b"externally-coded payload"[..],
-            bzip2::Compression::default(),
-        )
-        .read_to_end(&mut compressed)
-        .unwrap();
-
-        check!(decode_with(Codec::Bzip2, &compressed, 25).unwrap() == b"externally-coded payload");
-    }
-
-    #[cfg(not(feature = "codec-bzip2"))]
-    #[test]
-    fn decode_of_bzip2_reports_unavailable_when_feature_off() {
-        let blob = vec![2u8, 0, 1, 2, 3];
-        let err = decode(&blob, 3).unwrap_err();
-        check!(matches!(err, crate::Error::CodecUnavailable { id: 2, .. }));
-    }
-
-    #[cfg(feature = "codec-zstd")]
-    #[test]
-    fn decode_of_zstd_round_trips_a_known_stream() {
-        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
-        encoder
-            .write_all(b"the quick brown fox jumps over the lazy dog")
-            .unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        let mut blob = vec![4u8];
-        blob.extend_from_slice(&compressed);
-        check!(decode(&blob, 44).unwrap() == b"the quick brown fox jumps over the lazy dog");
-    }
-
-    #[cfg(feature = "codec-zstd")]
-    #[test]
-    fn decode_with_zstd_round_trips_without_a_leading_byte() {
-        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
-        encoder.write_all(b"externally-coded payload").unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        check!(decode_with(Codec::Zstd, &compressed, 25).unwrap() == b"externally-coded payload");
-    }
-
-    #[cfg(not(feature = "codec-zstd"))]
-    #[test]
-    fn decode_of_zstd_reports_unavailable_when_feature_off() {
-        let blob = vec![4u8, 0, 1, 2, 3];
-        let err = decode(&blob, 3).unwrap_err();
-        check!(matches!(err, crate::Error::CodecUnavailable { id: 4, .. }));
-    }
-
-    #[cfg(feature = "codec-brotli")]
-    #[test]
-    fn decode_of_brotli_round_trips_a_known_stream() {
-        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 9, 22);
-        encoder
-            .write_all(b"the quick brown fox jumps over the lazy dog")
-            .unwrap();
-        let compressed = encoder.into_inner();
-
-        let mut blob = vec![5u8];
-        blob.extend_from_slice(&compressed);
-        check!(decode(&blob, 44).unwrap() == b"the quick brown fox jumps over the lazy dog");
-    }
-
-    #[cfg(feature = "codec-brotli")]
-    #[test]
-    fn decode_with_brotli_round_trips_without_a_leading_byte() {
-        let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 9, 22);
-        encoder.write_all(b"externally-coded payload").unwrap();
-        let compressed = encoder.into_inner();
-
-        check!(decode_with(Codec::Brotli, &compressed, 25).unwrap() == b"externally-coded payload");
-    }
-
-    #[cfg(not(feature = "codec-brotli"))]
-    #[test]
-    fn decode_of_brotli_reports_unavailable_when_feature_off() {
-        let blob = vec![5u8, 0, 1, 2, 3];
-        let err = decode(&blob, 3).unwrap_err();
-        check!(matches!(err, crate::Error::CodecUnavailable { id: 5, .. }));
+    fn output_past_the_limit_is_an_error_not_a_truncation() {
+        let expect = Expect {
+            declared: None,
+            limit: 4,
+        };
+        check!(let Err(CodecError::TooLarge { limit: 4, .. }) = decode(Compression::ZLIB, &deflate(TEXT), expect));
     }
 
     #[test]
-    fn decode_of_an_empty_blob_errors() {
-        check!(let Err(crate::Error::EmptyBlob) = decode(&[], 0));
+    fn output_past_its_declared_size_is_an_error() {
+        check!(let Err(CodecError::TooLarge { limit: 4, .. }) = decode(Compression::ZLIB, &deflate(TEXT), exact(4)));
     }
 
     #[test]
-    fn decode_of_an_unknown_id_errors() {
-        check!(let Err(crate::Error::UnknownCodec { id: 42 }) = decode(&[42, 1, 2], 1));
+    fn output_short_of_its_declared_size_is_an_error() {
+        let got = decode(Compression::ZLIB, &deflate(TEXT), exact(TEXT.len() + 1));
+        check!(let Err(CodecError::Short { got: 43, want: 44, .. }) = got);
+    }
+
+    #[test]
+    fn a_declared_size_above_the_limit_is_refused_before_decoding() {
+        let expect = Expect {
+            declared: Some(100),
+            limit: 10,
+        };
+        check!(let Err(CodecError::TooLarge { limit: 10, .. }) = decode(Compression::NONE, &[0; 100], expect));
+    }
+
+    #[rstest]
+    #[case::unknown(Compression::from_raw(42))]
+    #[case::custom(Compression::CUSTOM)]
+    fn an_id_without_a_decoder_is_refused(#[case] id: Compression) {
+        check!(decode(id, &[1, 2, 3], exact(3)).is_err());
+    }
+
+    #[test]
+    fn an_empty_prefixed_blob_has_no_id() {
+        check!(let Err(CodecError::Empty) = decode_prefixed(&[], exact(0)));
     }
 }

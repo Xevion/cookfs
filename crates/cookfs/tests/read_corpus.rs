@@ -12,7 +12,7 @@ use std::path::Path;
 
 use assert2::check;
 use common::{Sample, manifest, samples_dir};
-use cookfs::{Archive, ArchiveVersion};
+use cookfs::{Archive, ArchiveVersion, OpenOptions};
 use positioned_io::{ReadAt, Size};
 
 /// Extracts the largest zip entry under any `/Contents/` path.
@@ -91,13 +91,15 @@ fn corpus_ready() -> bool {
 }
 
 fn assert_opens_and_walks<R: ReadAt + Size + Sync>(src: R, sample_name: &str) {
-    let archive = Archive::open(src).unwrap_or_else(|e| panic!("cannot open {sample_name}: {e}"));
+    let archive = Archive::open(src, &OpenOptions::default())
+        .unwrap_or_else(|e| panic!("cannot open {sample_name}: {e}"));
     let entries = archive.walk();
     check!(!entries.is_empty(), "{sample_name} has an empty tree");
 }
 
 fn assert_largest_file_reads<R: ReadAt + Size + Sync>(src: R, sample_name: &str) {
-    let archive = Archive::open(src).unwrap_or_else(|e| panic!("cannot open {sample_name}: {e}"));
+    let archive = Archive::open(src, &OpenOptions::default())
+        .unwrap_or_else(|e| panic!("cannot open {sample_name}: {e}"));
     let largest = archive
         .walk()
         .into_iter()
@@ -213,8 +215,8 @@ fn archive_version_matches_the_format_it_was_opened_from() {
             panic!("no raw {format} samples in corpus.toml");
         };
         let file = open_sample(&dir, &sample);
-        let archive =
-            Archive::open(file).unwrap_or_else(|e| panic!("cannot open {}: {e}", sample.name));
+        let archive = Archive::open(file, &OpenOptions::default())
+            .unwrap_or_else(|e| panic!("cannot open {}: {e}", sample.name));
         check!(
             archive.version() == expected,
             "{} opened as the wrong version",

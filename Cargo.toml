@@ -9,7 +9,9 @@ license = "MIT"
 repository = "https://github.com/Xevion/cookfs"
 
 [workspace.dependencies]
+arbitrary-int = "2.2.0"
 assert2 = "0.4.1"
+bitbybit = "2.0.1"
 brotli = "8.0.4"
 bzip2 = "0.6.1"
 flate2 = "1.1.9"
@@ -23,6 +25,7 @@ rstest = "0.26.1"
 snafu = "0.9.2"
 toml = "1.1.4"
 zip = "8.6.0"
+zerocopy = { version = "0.8.63", features = ["derive"] }
 zstd = "0.13.3"
 
 [workspace.lints.rust]

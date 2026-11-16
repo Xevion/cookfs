@@ -1,62 +1,54 @@
-//! The normalized page table shared by every format-specific parser.
+//! The page table every format-specific parser normalizes into.
 //!
-//! `CFS0002` and `CFS0003` name a page's codec differently: a blob's own
-//! leading byte, or an id carried out of band in a separate table. Everything
-//! past `Archive::open` reads through [`PageEntry::codec`] instead of asking
-//! which format it opened, so the version branch fires once, at parse time.
+//! `CFS0002` names a blob's codec in the blob's own first byte, `CFS0003` in a
+//! separate table. Past [`crate::Archive::open`] nothing asks which format it
+//! opened: every read goes through a [`BlobRef`].
 
-use crate::codec::Codec;
+use crate::codec::{self, CodecError, Expect};
+use crate::wire::Compression;
 
-/// How to decode one blob: a page, or the fsindex itself.
+/// How a blob names its codec.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum PageCodec {
-    /// The blob's own leading byte names its codec (`CFS0002`).
+pub(crate) enum Codec {
+    /// The blob's first byte names it (`CFS0002`).
     Prefixed,
-    /// The codec is already known; the blob carries no leading byte (`CFS0003`).
-    External(Codec),
+    /// A table outside the blob names it, and the blob carries no id byte (`CFS0003`).
+    External(Compression),
 }
 
-/// One page's location, size, and how to decode it.
+/// Where one compressed blob lives and what it should decode to.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PageEntry {
-    /// Byte offset of the page's compressed data in the source.
-    pub offset: u64,
-    /// Compressed length in bytes.
-    pub compressed_len: u32,
-    /// Decompressed length in bytes.
-    pub uncompressed_len: u32,
-    /// How to decode this page's blob.
-    pub codec: PageCodec,
+pub(crate) struct BlobRef {
+    /// Offset of the compressed bytes in the source.
+    pub(crate) at: u64,
+    /// Compressed length.
+    pub(crate) len: u32,
+    /// How the blob names its codec.
+    pub(crate) codec: Codec,
+    /// Decoded length, when the archive records one.
+    pub(crate) declared: Option<u32>,
 }
 
-/// Every page an archive holds, in page-index order.
-#[derive(Debug, Default)]
-pub(crate) struct PageTable {
-    /// One entry per page, indexed by page number.
-    pub entries: Vec<PageEntry>,
+impl BlobRef {
+    pub(crate) fn decode(&self, raw: &[u8], limit: usize) -> Result<Vec<u8>, CodecError> {
+        let expect = Expect {
+            declared: self.declared.map(|n| n as usize),
+            limit,
+        };
+        match self.codec {
+            Codec::Prefixed => codec::decode_prefixed(raw, expect),
+            Codec::External(id) => codec::decode(id, raw, expect),
+        }
+    }
 }
 
-/// Everything `Archive::open` needs once a format-specific parser has run.
-///
-/// Producing this is the one place a version branch fires: every parser in
-/// `parsers` builds one of these from its own trailer shape, and every read
-/// path afterward is version-blind.
+/// Everything [`crate::Archive::open`] needs once a format parser has run.
 #[derive(Debug)]
 pub(crate) struct Layout {
-    /// The page table.
-    pub pages: PageTable,
-    /// Byte offset of the compressed fsindex blob.
-    pub fsindex_at: u64,
-    /// Compressed length of the fsindex blob.
-    pub fsindex_len: usize,
-    /// Decompressed length of the fsindex blob, if the format declares one.
-    ///
-    /// `CFS0003` always knows this; `CFS0002`'s trailer has no such field.
-    /// Only [`Codec::Lzma`] needs it, to bound a raw LZMA1 stream that has no
-    /// end-of-stream marker of its own.
-    pub fsindex_uncompressed_len: Option<u32>,
-    /// How to decode the fsindex blob.
-    pub fsindex_codec: PageCodec,
-    /// `CFS0003`'s encryption byte; `None` for `CFS0002`, which has none.
-    pub encryption: Option<u8>,
+    /// Every data page, in page-index order.
+    pub(crate) pages: Vec<BlobRef>,
+    /// The fsindex blob, or `None` for an archive written with an empty index.
+    pub(crate) fsindex: Option<BlobRef>,
+    /// The `CFS0003` encryption byte; `CFS0002` has none.
+    pub(crate) encryption: Option<crate::Encryption>,
 }

@@ -14,6 +14,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+arbitrary-int.workspace = true
+bitbybit.workspace = true
 brotli = { workspace = true, optional = true }
 bzip2 = { workspace = true, optional = true }
 flate2.workspace = true
@@ -23,6 +25,7 @@ lru.workspace = true
 parking_lot.workspace = true
 positioned-io.workspace = true
 snafu.workspace = true
+zerocopy.workspace = true
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]

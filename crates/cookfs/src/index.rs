@@ -1,91 +1,177 @@
-//! The fsindex: the directory tree stored inside a decompressed fsindex blob.
+//! The fsindex: the directory tree inside a decoded fsindex blob.
 //!
-//! A directory's children are inlined depth-first, immediately after the
-//! directory entry that owns them, rather than pointed to by offset. Reading
-//! the tree is therefore a single linear pass over the blob.
+//! A directory's children are inlined depth-first, straight after the entry
+//! that owns them, so the tree is read in one linear pass. The pass keeps its
+//! own stack of open directories rather than recursing, so a deep tree cannot
+//! overflow the thread's stack.
+//!
+//! ```text
+//! "CFS2.200"
+//! u32 root child count
+//! entry*:   u8 name_len, name, NUL, i64 mtime, i32 block_count
+//!           block_count == -1: u32 child_count, then the children
+//!           otherwise:         block_count * (i32 page, i32 offset, i32 size)
+//! u32 metadata count, then per record: u32 len, len bytes
+//! ```
 
 use la_arena::Arena;
 pub use la_arena::Idx;
-use snafu::ensure;
+use snafu::{ResultExt, Snafu, ensure};
+use zerocopy::byteorder::big_endian::{I32, I64, U32};
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use crate::read::{BadMagicSnafu, Cursor, DesyncSnafu, FSINDEX_MAGIC, MAX_PREALLOC, Result};
+use crate::bytes::{BytesError, Reader};
 
-/// One compressed byte range that a file's contents span.
-#[derive(Debug, Clone, Copy)]
-pub struct Block {
-    /// Index of the page holding this range, in the archive's page table.
-    pub page: i32,
-    /// Byte offset into the page's decompressed bytes.
-    pub offset: i32,
-    /// Length of the range in bytes.
-    pub size: i32,
+/// The magic that opens every decoded fsindex, in both formats.
+pub(crate) const MAGIC: &[u8; 8] = b"CFS2.200";
+
+/// A decoded fsindex that does not describe a valid tree.
+#[derive(Debug, Snafu)]
+#[snafu(module, context(suffix(false)), visibility(pub(crate)))]
+pub enum IndexError {
+    /// The blob does not open with `CFS2.200`.
+    #[snafu(display("fsindex magic is {found:02x?}, not CFS2.200"))]
+    BadMagic {
+        /// The first bytes of the blob, zero-padded when it is shorter.
+        found: [u8; 8],
+    },
+    /// A record ran past the end of the blob.
+    #[snafu(display("fsindex record is truncated"))]
+    Truncated {
+        /// Where the read failed.
+        source: BytesError,
+    },
+    /// Directories nest deeper than the configured limit.
+    #[snafu(display("fsindex nests directories deeper than {limit}"))]
+    TooDeep {
+        /// The configured depth limit.
+        limit: usize,
+    },
+    /// A block names a negative page, offset or size.
+    #[snafu(display("fsindex block names page {page}, offset {offset}, size {size}"))]
+    NegativeBlock {
+        /// The page as stored.
+        page: i32,
+        /// The offset as stored.
+        offset: i32,
+        /// The size as stored.
+        size: i32,
+    },
+    /// A block count is negative but is not the directory marker.
+    #[snafu(display("fsindex entry has block count {count}"))]
+    BadBlockCount {
+        /// The count as stored.
+        count: i32,
+    },
+    /// Bytes remain after the tree and its metadata.
+    #[snafu(display("fsindex has {extra} bytes after its metadata"))]
+    Trailing {
+        /// How many bytes were left unread.
+        extra: usize,
+    },
 }
 
-/// What a node in the tree is: a directory of children, or a file's blocks.
+const _: () = assert!(size_of::<IndexError>() <= 64);
+
+/// One byte range of a file's contents, inside one decoded page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Block {
+    /// Index of the page in the archive's page table.
+    pub page: u32,
+    /// Offset into the decoded page.
+    pub offset: u32,
+    /// Length in bytes.
+    pub size: u32,
+}
+
+/// What a node is: a directory of children, or a file's blocks.
 #[derive(Debug)]
 pub enum Kind {
     /// A directory, holding its children in fsindex order.
     Dir(Vec<Idx<Node>>),
-    /// A file, holding the blocks that make up its contents.
+    /// A file, holding the blocks that make up its contents in order.
     File(Vec<Block>),
 }
 
-/// One entry in the fsindex tree: a file or a directory.
+/// One entry in the tree.
 #[derive(Debug)]
 pub struct Node {
-    /// The entry's own name, not its full path.
+    /// The entry's own name, not its path.
     pub name: String,
-    /// Modification time, in whatever epoch the archive's Tcl runtime used.
+    /// Modification time as the writing Tcl runtime recorded it.
     pub mtime: i64,
     /// The parent directory, or `None` for the root.
     pub parent: Option<Idx<Self>>,
-    /// Whether this entry is a file or a directory, and its payload.
+    /// Directory or file, with its payload.
     pub kind: Kind,
 }
 
 impl Node {
     /// Whether this entry is a directory.
     #[must_use]
-    pub fn is_dir(&self) -> bool {
+    pub const fn is_dir(&self) -> bool {
         matches!(self.kind, Kind::Dir(_))
     }
 
-    /// Decompressed size: the sum of a file's blocks, or 0 for a directory.
+    /// Decoded size: the sum of a file's blocks, or 0 for a directory.
     #[must_use]
     pub fn size(&self) -> u64 {
         match &self.kind {
-            Kind::File(blocks) => blocks.iter().map(|b| b.size.max(0) as u64).sum(),
+            Kind::File(blocks) => blocks.iter().map(|b| u64::from(b.size)).sum(),
             Kind::Dir(_) => 0,
         }
     }
 }
 
-/// The parsed directory tree of one archive.
+/// The parsed tree of one archive.
 #[derive(Debug)]
 pub(crate) struct Index {
-    /// Arena holding every node keyed by its [`Idx`].
-    pub nodes: Arena<Node>,
-    /// Handle of the archive's implicit root directory.
-    pub root: Idx<Node>,
+    pub(crate) nodes: Arena<Node>,
+    pub(crate) root: Idx<Node>,
 }
 
-impl Index {
-    /// Parses a decompressed fsindex blob into a tree.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::BadMagic`] if the blob does not open with the
-    /// expected magic, [`crate::Error::Truncated`] if a truncated or crafted
-    /// blob runs out of bytes mid-record, or [`crate::Error::Desync`] if the
-    /// parser does not consume exactly the bytes it was given.
-    pub(crate) fn parse(blob: &[u8]) -> Result<Self> {
-        ensure!(
-            blob.starts_with(FSINDEX_MAGIC),
-            BadMagicSnafu {
-                magic: blob[..FSINDEX_MAGIC.len().min(blob.len())].to_vec()
-            }
-        );
+/// The fixed fields after an entry's name.
+#[derive(FromBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct EntryHead {
+    mtime: I64,
+    block_count: I32,
+}
 
+#[derive(FromBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct RawBlock {
+    page: I32,
+    offset: I32,
+    size: I32,
+}
+
+const DIR_MARKER: i32 = -1;
+
+/// The smallest entry: a zero-length name, its NUL, and the fixed head.
+const MIN_ENTRY_LEN: usize = 1 + 1 + size_of::<EntryHead>();
+
+impl Index {
+    /// A tree holding only the root, for an archive written with no fsindex.
+    pub(crate) fn empty() -> Self {
+        let mut nodes = Arena::new();
+        let root = nodes.alloc(Node {
+            name: String::new(),
+            mtime: 0,
+            parent: None,
+            kind: Kind::Dir(Vec::new()),
+        });
+        Self { nodes, root }
+    }
+
+    /// Parses a decoded fsindex blob into a tree no deeper than `max_depth`.
+    pub(crate) fn parse(blob: &[u8], max_depth: usize) -> Result<Self, IndexError> {
+        let mut found = [0u8; 8];
+        let head = &blob[..blob.len().min(8)];
+        found[..head.len()].copy_from_slice(head);
+        ensure!(&found == MAGIC, index_error::BadMagic { found });
+
+        let mut r = Reader::new(&blob[MAGIC.len()..]);
         let mut nodes = Arena::new();
         let root = nodes.alloc(Node {
             name: String::new(),
@@ -94,211 +180,250 @@ impl Index {
             kind: Kind::Dir(Vec::new()),
         });
 
-        let mut cursor = Cursor::new(blob);
-        cursor.take(FSINDEX_MAGIC.len())?;
-        let children = read_dir(&mut cursor, &mut nodes, root)?;
-        nodes[root].kind = Kind::Dir(children);
+        // Each open directory with the count of its children still unread.
+        let mut open = vec![(root, read_child_count(&mut r)?)];
+        while let Some((dir, left)) = open.last_mut() {
+            if *left == 0 {
+                open.pop();
+                continue;
+            }
+            *left -= 1;
+            let parent = *dir;
 
-        // Trailing metadata records (archive-wide key/value pairs) follow the tree.
-        // Unused here, but still consumed to prove the blob was read in full.
-        let count = cursor.be32()? as usize;
+            let len = r.u8().context(index_error::Truncated)?;
+            let name = String::from_utf8_lossy(r.take(len.into()).context(index_error::Truncated)?)
+                .into_owned();
+            r.take(1).context(index_error::Truncated)?; // the name's NUL
+            let head = r.record::<EntryHead>().context(index_error::Truncated)?;
+
+            let (kind, children) = match head.block_count.get() {
+                DIR_MARKER => {
+                    let count = read_child_count(&mut r)?;
+                    (Kind::Dir(Vec::with_capacity(count)), Some(count))
+                }
+                count @ 0.. => {
+                    let raw = r
+                        .records::<RawBlock>(count.unsigned_abs())
+                        .context(index_error::Truncated)?;
+                    (
+                        Kind::File(raw.iter().map(block).collect::<Result<_, _>>()?),
+                        None,
+                    )
+                }
+                count => return index_error::BadBlockCount { count }.fail(),
+            };
+
+            let idx = nodes.alloc(Node {
+                name,
+                mtime: head.mtime.get(),
+                parent: Some(parent),
+                kind,
+            });
+            if let Kind::Dir(siblings) = &mut nodes[parent].kind {
+                siblings.push(idx);
+            }
+            if let Some(count) = children {
+                ensure!(
+                    open.len() < max_depth,
+                    index_error::TooDeep { limit: max_depth }
+                );
+                open.push((idx, count));
+            }
+        }
+
+        // Archive-wide key/value records follow the tree; consumed here so a
+        // desynchronized parse cannot pass as complete.
+        let count = r.record::<U32>().context(index_error::Truncated)?.get();
+        let count = r
+            .check_count(count, size_of::<U32>())
+            .context(index_error::Truncated)?;
         for _ in 0..count {
-            let len = cursor.be32()? as usize;
-            cursor.take(len)?;
+            let len = r.record::<U32>().context(index_error::Truncated)?.get();
+            r.take(len as usize).context(index_error::Truncated)?;
         }
 
         ensure!(
-            cursor.pos() == blob.len(),
-            DesyncSnafu {
-                got: cursor.pos(),
-                len: blob.len()
+            r.remaining() == 0,
+            index_error::Trailing {
+                extra: r.remaining()
             }
         );
-
         Ok(Self { nodes, root })
     }
 
-    /// Walks the tree depth-first, yielding each node with its full path.
+    /// Every node in pre-order, siblings sorted by name, with its full path.
     pub(crate) fn walk(&self) -> Vec<(String, Idx<Node>)> {
         let mut out = Vec::new();
-        self.walk_into(self.root, "", &mut out);
+        let mut pending = Vec::new();
+        self.queue_children(self.root, "", &mut pending);
+        while let Some((idx, path)) = pending.pop() {
+            self.queue_children(idx, &path, &mut pending);
+            out.push((path, idx));
+        }
         out
     }
 
-    fn walk_into(&self, at: Idx<Node>, prefix: &str, out: &mut Vec<(String, Idx<Node>)>) {
-        let Kind::Dir(children) = &self.nodes[at].kind else {
+    /// Pushes a directory's children in reverse name order, so popping yields them sorted.
+    fn queue_children(&self, dir: Idx<Node>, prefix: &str, pending: &mut Vec<(Idx<Node>, String)>) {
+        let Kind::Dir(children) = &self.nodes[dir].kind else {
             return;
         };
-        let mut sorted: Vec<_> = children.clone();
-        sorted.sort_by(|&a, &b| self.nodes[a].name.cmp(&self.nodes[b].name));
-
-        for child in sorted {
-            let node = &self.nodes[child];
+        let mut sorted = children.clone();
+        sorted.sort_by(|&a, &b| self.nodes[b].name.cmp(&self.nodes[a].name));
+        pending.extend(sorted.into_iter().map(|child| {
+            let name = &self.nodes[child].name;
             let path = if prefix.is_empty() {
-                node.name.clone()
+                name.clone()
             } else {
-                format!("{prefix}/{}", node.name)
+                format!("{prefix}/{name}")
             };
-            out.push((path.clone(), child));
-            if node.is_dir() {
-                self.walk_into(child, &path, out);
-            }
-        }
+            (child, path)
+        }));
     }
 }
 
-const DIR_MARKER: i32 = -1;
+fn read_child_count(r: &mut Reader<'_>) -> Result<usize, IndexError> {
+    let count = r.record::<U32>().context(index_error::Truncated)?.get();
+    r.check_count(count, MIN_ENTRY_LEN)
+        .context(index_error::Truncated)
+}
 
-fn read_dir(
-    cursor: &mut Cursor<'_>,
-    nodes: &mut Arena<Node>,
-    parent: Idx<Node>,
-) -> Result<Vec<Idx<Node>>> {
-    let count = cursor.be32()? as usize;
-
-    let mut out = Vec::with_capacity(count.min(MAX_PREALLOC));
-    for _ in 0..count {
-        let nlen = cursor.u8()? as usize;
-        let name = String::from_utf8_lossy(cursor.take(nlen)?).into_owned();
-        cursor.take(1)?; // trailing NUL
-
-        let mtime = cursor.be64i()?;
-        let nblocks = cursor.be32i()?;
-
-        if nblocks == DIR_MARKER {
-            let idx = nodes.alloc(Node {
-                name,
-                mtime,
-                parent: Some(parent),
-                kind: Kind::Dir(Vec::new()),
-            });
-            // Subdirectories are inlined here, mid-list, before the parent's
-            // next sibling.
-            let children = read_dir(cursor, nodes, idx)?;
-            nodes[idx].kind = Kind::Dir(children);
-            out.push(idx);
-        } else {
-            let cap = (nblocks.max(0) as usize).min(MAX_PREALLOC);
-            let mut blocks = Vec::with_capacity(cap);
-            for _ in 0..nblocks {
-                blocks.push(Block {
-                    page: cursor.be32i()?,
-                    offset: cursor.be32i()?,
-                    size: cursor.be32i()?,
-                });
-            }
-            out.push(nodes.alloc(Node {
-                name,
-                mtime,
-                parent: Some(parent),
-                kind: Kind::File(blocks),
-            }));
-        }
+fn block(raw: &RawBlock) -> Result<Block, IndexError> {
+    let (page, offset, size) = (raw.page.get(), raw.offset.get(), raw.size.get());
+    match (
+        u32::try_from(page),
+        u32::try_from(offset),
+        u32::try_from(size),
+    ) {
+        (Ok(page), Ok(offset), Ok(size)) => Ok(Block { page, offset, size }),
+        _ => index_error::NegativeBlock { page, offset, size }.fail(),
     }
-    Ok(out)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use assert2::check;
 
-    fn file_entry(name: &str, mtime: i64, blocks: &[Block]) -> Vec<u8> {
-        let mut out = vec![name.len() as u8];
-        out.extend_from_slice(name.as_bytes());
-        out.push(0);
-        out.extend_from_slice(&mtime.to_be_bytes());
-        out.extend_from_slice(&(blocks.len() as i32).to_be_bytes());
-        for b in blocks {
-            out.extend_from_slice(&b.page.to_be_bytes());
-            out.extend_from_slice(&b.offset.to_be_bytes());
-            out.extend_from_slice(&b.size.to_be_bytes());
+    /// Builds fsindex blobs entry by entry, in the order they appear on disk.
+    #[derive(Default)]
+    pub(crate) struct Fsindex {
+        body: Vec<u8>,
+    }
+
+    impl Fsindex {
+        pub(crate) fn new(root_children: u32) -> Self {
+            let mut body = MAGIC.to_vec();
+            body.extend_from_slice(&root_children.to_be_bytes());
+            Self { body }
         }
-        out
+
+        fn name(&mut self, name: &str) {
+            self.body.push(name.len() as u8);
+            self.body.extend_from_slice(name.as_bytes());
+            self.body.push(0);
+            self.body.extend_from_slice(&0i64.to_be_bytes());
+        }
+
+        pub(crate) fn file(mut self, name: &str, blocks: &[(i32, i32, i32)]) -> Self {
+            self.name(name);
+            self.body
+                .extend_from_slice(&(blocks.len() as i32).to_be_bytes());
+            for &block in blocks {
+                let fields: [i32; 3] = block.into();
+                for v in fields {
+                    self.body.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            self
+        }
+
+        pub(crate) fn dir(mut self, name: &str, children: u32) -> Self {
+            self.name(name);
+            self.body.extend_from_slice(&DIR_MARKER.to_be_bytes());
+            self.body.extend_from_slice(&children.to_be_bytes());
+            self
+        }
+
+        pub(crate) fn finish(mut self) -> Vec<u8> {
+            self.body.extend_from_slice(&0u32.to_be_bytes());
+            self.body
+        }
     }
 
-    fn dir_entry(name: &str, mtime: i64, child_count: u32, children: &[u8]) -> Vec<u8> {
-        let mut out = vec![name.len() as u8];
-        out.extend_from_slice(name.as_bytes());
-        out.push(0);
-        out.extend_from_slice(&mtime.to_be_bytes());
-        out.extend_from_slice(&DIR_MARKER.to_be_bytes());
-        out.extend_from_slice(&child_count.to_be_bytes());
-        out.extend_from_slice(children);
-        out
-    }
-
-    /// One directory ("docs") holding one file ("readme.txt"), at the root.
-    fn one_dir_one_file_blob() -> Vec<u8> {
-        let file = file_entry(
-            "readme.txt",
-            1_700_000_000,
-            &[Block {
-                page: 0,
-                offset: 0,
-                size: 42,
-            }],
-        );
-        let dir = dir_entry("docs", 1_700_000_000, 1, &file);
-
-        let mut blob = FSINDEX_MAGIC.to_vec();
-        blob.extend_from_slice(&1u32.to_be_bytes()); // root has one child
-        blob.extend_from_slice(&dir);
-        blob.extend_from_slice(&0u32.to_be_bytes()); // zero metadata records
-        blob
-    }
-
-    #[test]
-    fn parse_rejects_a_blob_with_the_wrong_magic() {
-        check!(let Err(crate::Error::BadMagic { .. }) = Index::parse(b"not the magic bytes"));
-    }
-
-    #[test]
-    fn parse_reads_one_directory_with_one_file() {
-        let blob = one_dir_one_file_blob();
-        let index = Index::parse(&blob).unwrap();
-
-        let Kind::Dir(root_children) = &index.nodes[index.root].kind else {
-            panic!("root must be a directory");
-        };
-        check!(root_children.len() == 1);
-
-        let dir = &index.nodes[root_children[0]];
-        check!(dir.name == "docs");
-        check!(dir.is_dir());
-
-        let Kind::Dir(dir_children) = &dir.kind else {
-            panic!("docs must be a directory");
-        };
-        check!(dir_children.len() == 1);
-
-        let file = &index.nodes[dir_children[0]];
-        check!(file.name == "readme.txt");
-        check!(!file.is_dir());
-        check!(file.size() == 42);
+    fn paths(index: &Index) -> Vec<String> {
+        index.walk().into_iter().map(|(path, _)| path).collect()
     }
 
     #[test]
-    fn walk_yields_the_full_path_for_every_node() {
-        let blob = one_dir_one_file_blob();
-        let index = Index::parse(&blob).unwrap();
-
-        let paths: Vec<String> = index.walk().into_iter().map(|(path, _)| path).collect();
-        check!(paths == vec!["docs".to_owned(), "docs/readme.txt".to_owned()]);
+    fn an_inlined_subdirectory_resumes_its_parents_list_after_it() {
+        let blob = Fsindex::new(2)
+            .dir("docs", 1)
+            .file("readme.txt", &[(0, 0, 42)])
+            .file("z.txt", &[(0, 42, 1)])
+            .finish();
+        let index = Index::parse(&blob, 8).unwrap();
+        check!(paths(&index) == ["docs", "docs/readme.txt", "z.txt"]);
     }
 
     #[test]
-    fn parse_rejects_a_blob_with_trailing_garbage() {
-        let mut blob = one_dir_one_file_blob();
-        blob.push(0xFF); // one byte the parser never consumes
-        check!(let Err(crate::Error::Desync { .. }) = Index::parse(&blob));
+    fn walk_is_pre_order_with_siblings_sorted_by_name() {
+        let blob = Fsindex::new(2)
+            .dir("b", 1)
+            .file("x", &[])
+            .dir("a", 0)
+            .finish();
+        let index = Index::parse(&blob, 8).unwrap();
+        check!(paths(&index) == ["a", "b", "b/x"]);
     }
 
-    /// A truncated fsindex must error cleanly, not panic on an out-of-bounds slice.
     #[test]
-    fn parse_errors_instead_of_panicking_on_a_truncated_blob() {
-        let mut blob = one_dir_one_file_blob();
+    fn a_file_sums_its_blocks() {
+        let blob = Fsindex::new(1).file("f", &[(0, 0, 3), (1, 0, 4)]).finish();
+        let index = Index::parse(&blob, 8).unwrap();
+        let (_, f) = index.walk()[0].clone();
+        check!(index.nodes[f].size() == 7);
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_limit_is_refused() {
+        let mut fs = Fsindex::new(1);
+        for _ in 0..4 {
+            fs = fs.dir("d", 1);
+        }
+        let blob = fs.file("f", &[]).finish();
+        check!(let Err(IndexError::TooDeep { limit: 3 }) = Index::parse(&blob, 3));
+    }
+
+    #[test]
+    fn a_negative_block_field_is_refused_at_parse() {
+        let blob = Fsindex::new(1).file("f", &[(0, -1, 4)]).finish();
+        check!(let Err(IndexError::NegativeBlock { offset: -1, .. }) = Index::parse(&blob, 8));
+    }
+
+    #[test]
+    fn a_child_count_larger_than_the_blob_fails_without_allocating() {
+        let mut blob = MAGIC.to_vec();
+        blob.extend_from_slice(&u32::MAX.to_be_bytes());
+        check!(let Err(IndexError::Truncated { .. }) = Index::parse(&blob, 8));
+    }
+
+    #[test]
+    fn the_wrong_magic_is_refused() {
+        check!(let Err(IndexError::BadMagic { .. }) = Index::parse(b"not the magic", 8));
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let mut blob = Fsindex::new(1).file("f", &[]).finish();
+        blob.push(0xFF);
+        check!(let Err(IndexError::Trailing { extra: 1 }) = Index::parse(&blob, 8));
+    }
+
+    #[test]
+    fn a_truncated_blob_errors_instead_of_panicking() {
+        let mut blob = Fsindex::new(1).file("f", &[(0, 0, 4)]).finish();
         blob.truncate(blob.len() - 5);
-        check!(let Err(crate::Error::Truncated { .. }) = Index::parse(&blob));
+        check!(let Err(IndexError::Truncated { .. }) = Index::parse(&blob, 8));
     }
 }

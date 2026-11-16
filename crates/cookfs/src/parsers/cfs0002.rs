@@ -1,157 +1,176 @@
-//! `CFS0002` trailer and page-table parsing.
+//! The `CFS0002` trailer, the format InstallBuilder ships.
 //!
-//! Everything a `CFS0002` archive needs to describe itself lives in a
-//! fixed-shape trailer appended after the signature: a 9-byte head, a
-//! page-size table, and a 16-byte-per-page meta table, each addressed by
-//! walking outward from the signature using the previous field's length.
+//! Every region is addressed by walking backward from the signature, each
+//! offset the previous one less a length the trailer records:
+//!
+//! ```text
+//! [pages][N x 16-byte hash slot][N x u32 compressed size][fsindex]
+//! [u32 fsindex size][u32 N][u8 default compression]["CFS0002"]
+//! ```
+//!
+//! Every blob names its own codec in its first byte; the default the head
+//! records is informational.
 
 use positioned_io::ReadAt;
-use snafu::OptionExt;
+use snafu::ResultExt;
+use zerocopy::byteorder::big_endian::U32;
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use crate::page::{Layout, PageCodec, PageEntry, PageTable};
-use crate::read::{BadPageTableSnafu, MAX_PREALLOC, Result, at, be32};
+use super::{TrailerError, before, trailer_error};
+use crate::page::{BlobRef, Codec, Layout};
+use crate::source;
 
-/// The seven bytes that mark the end of a `CFS0002` trailer.
+/// The seven bytes that end a `CFS0002` trailer.
 pub(crate) const SIGNATURE: &[u8] = b"CFS0002";
 
-/// Parses the trailer and page table behind a `CFS0002` signature at `sig_at`.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::BadPageTable`] if any length-prefixed field would
-/// place a region before offset 0, or [`crate::Error::Io`] if a read runs
-/// past the source's bounds.
-pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout> {
-    let head_at = sig_at.checked_sub(9).context(BadPageTableSnafu)?;
-    let head = at(src, head_at, 9)?;
-    let fsindex_len = be32(&head, 0) as usize;
-    let page_count = be32(&head, 4) as usize;
-    // head[8] is the archive-wide codec id; every blob names its own id, so
-    // it carries no information this reader needs.
+/// The fixed fields between the fsindex and the signature.
+#[derive(FromBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Head {
+    fsindex_len: U32,
+    page_count: U32,
+    default_compression: u8,
+}
 
-    let fsindex_at = head_at
-        .checked_sub(fsindex_len as u64)
-        .context(BadPageTableSnafu)?;
-    let sizes_at = fsindex_at
-        .checked_sub(4 * page_count as u64)
-        .context(BadPageTableSnafu)?;
-    // 16 bytes per page. Upstream calls this an MD5 digest; with
-    // `cookfs.pagehash: crc32` the last 8 bytes read as size + CRC-32.
-    let meta_at = sizes_at
-        .checked_sub(16 * page_count as u64)
-        .context(BadPageTableSnafu)?;
+/// One page's 16-byte hash slot.
+#[derive(Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Slot([u8; 16]);
 
-    let raw = at(src, sizes_at, 4 * page_count)?;
-    let page_sizes: Vec<u32> = (0..page_count).map(|i| be32(&raw, i * 4)).collect();
-
-    let total: u64 = page_sizes.iter().map(|&s| u64::from(s)).sum();
-    let pages_at = meta_at.checked_sub(total).context(BadPageTableSnafu)?;
-
-    let meta = at(src, meta_at, 16 * page_count)?;
-    let page_uncompressed: Vec<u32> = (0..page_count).map(|i| be32(&meta, i * 16 + 8)).collect();
-
-    let mut offset = pages_at;
-    let mut entries = Vec::with_capacity(page_count.min(MAX_PREALLOC));
-    for i in 0..page_count {
-        entries.push(PageEntry {
-            offset,
-            compressed_len: page_sizes[i],
-            uncompressed_len: page_uncompressed[i],
-            codec: PageCodec::Prefixed,
-        });
-        offset += u64::from(page_sizes[i]);
+impl Slot {
+    /// The uncompressed size, which `crc32` hash mode stores at offset 8.
+    fn declared_len(self) -> u32 {
+        u32::from_be_bytes([self.0[8], self.0[9], self.0[10], self.0[11]])
     }
+}
+
+/// Parses the trailer behind a `CFS0002` signature at `sig_at`.
+pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout, TrailerError> {
+    let head_at = before("trailer head", sig_at, size_of::<Head>() as u64)?;
+    let head = read::<Head, _>(src, head_at)?;
+    let pages = u64::from(head.page_count.get());
+
+    let fsindex_len = head.fsindex_len.get();
+    let fsindex_at = before("fsindex", head_at, fsindex_len.into())?;
+    let sizes_at = before("page size table", fsindex_at, pages * 4)?;
+    let slots_at = before("page hash table", sizes_at, pages * 16)?;
+
+    let sizes_raw = source::at(src, sizes_at, (pages * 4) as usize).context(trailer_error::Read)?;
+    let sizes = <[U32]>::ref_from_bytes(&sizes_raw).unwrap_or(&[]);
+    let slots_raw =
+        source::at(src, slots_at, (pages * 16) as usize).context(trailer_error::Read)?;
+    let slots = <[Slot]>::ref_from_bytes(&slots_raw).unwrap_or(&[]);
+
+    let total: u64 = sizes.iter().map(|s| u64::from(s.get())).sum();
+    let mut at = before("page data", slots_at, total)?;
+
+    let pages = sizes
+        .iter()
+        .zip(slots)
+        .map(|(size, slot)| {
+            let page = BlobRef {
+                at,
+                len: size.get(),
+                codec: Codec::Prefixed,
+                declared: Some(slot.declared_len()),
+            };
+            at += u64::from(size.get());
+            page
+        })
+        .collect();
 
     Ok(Layout {
-        pages: PageTable { entries },
-        fsindex_at,
-        fsindex_len,
-        fsindex_uncompressed_len: None,
-        fsindex_codec: PageCodec::Prefixed,
+        pages,
+        fsindex: (fsindex_len > 0).then_some(BlobRef {
+            at: fsindex_at,
+            len: fsindex_len,
+            codec: Codec::Prefixed,
+            declared: None,
+        }),
         encryption: None,
     })
 }
 
+fn read<T: FromBytes, R: ReadAt>(src: &R, at: u64) -> Result<T, TrailerError> {
+    let raw = source::at(src, at, size_of::<T>()).context(trailer_error::Read)?;
+    T::read_from_bytes(&raw).map_err(|_| TrailerError::Underflow {
+        region: "trailer head",
+        len: size_of::<T>() as u64,
+        end: at,
+    })
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use assert2::check;
 
-    /// Builds a minimal trailer with zero pages: fsindex blob, then the
-    /// 9-byte head, then the signature.
-    fn minimal_trailer_buffer(fsindex: &[u8], codec: u8) -> (Vec<u8>, u64) {
-        let mut buf = fsindex.to_vec();
-        buf.extend_from_slice(&(fsindex.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.push(codec);
-        let sig_at = buf.len() as u64;
-        buf.extend_from_slice(SIGNATURE);
-        (buf, sig_at)
-    }
-
-    #[test]
-    fn parse_reads_an_empty_archive_with_zero_pages() {
-        let (buf, sig_at) = minimal_trailer_buffer(b"fake-fsindex", 3);
-        let layout = parse(&buf.as_slice(), sig_at).unwrap();
-
-        check!(layout.fsindex_at == 0);
-        check!(layout.fsindex_len == 12);
-        check!(layout.pages.entries.is_empty());
-        check!(layout.encryption.is_none());
-    }
-
-    #[test]
-    fn parse_reads_pages_with_offsets_and_sizes() {
+    /// Builds a `CFS0002` archive from already-encoded page and fsindex blobs.
+    pub(crate) fn archive(pages: &[(Vec<u8>, [u8; 16])], fsindex: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&[0u8; 10]); // page 0 compressed data
-        buf.extend_from_slice(&[0u8; 20]); // page 1 compressed data
-
-        let mut meta0 = vec![0u8; 16];
-        meta0[8..12].copy_from_slice(&100u32.to_be_bytes());
-        let mut meta1 = vec![0u8; 16];
-        meta1[8..12].copy_from_slice(&200u32.to_be_bytes());
-        buf.extend_from_slice(&meta0);
-        buf.extend_from_slice(&meta1);
-
-        buf.extend_from_slice(&10u32.to_be_bytes());
-        buf.extend_from_slice(&20u32.to_be_bytes());
-
-        let fsindex = b"fake-fsindex-blob";
+        for (blob, _) in pages {
+            buf.extend_from_slice(blob);
+        }
+        for (_, slot) in pages {
+            buf.extend_from_slice(slot);
+        }
+        for (blob, _) in pages {
+            buf.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        }
         buf.extend_from_slice(fsindex);
-
         buf.extend_from_slice(&(fsindex.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&2u32.to_be_bytes());
-        buf.push(7);
-
-        let sig_at = buf.len() as u64;
+        buf.extend_from_slice(&(pages.len() as u32).to_be_bytes());
+        buf.push(0);
         buf.extend_from_slice(SIGNATURE);
+        buf
+    }
 
-        let layout = parse(&buf.as_slice(), sig_at).unwrap();
-        check!(layout.pages.entries.len() == 2);
-        check!(layout.pages.entries[0].offset == 0);
-        check!(layout.pages.entries[0].compressed_len == 10);
-        check!(layout.pages.entries[0].uncompressed_len == 100);
-        check!(layout.pages.entries[1].offset == 10);
-        check!(layout.pages.entries[1].compressed_len == 20);
-        check!(layout.pages.entries[1].uncompressed_len == 200);
-        check!(matches!(layout.pages.entries[0].codec, PageCodec::Prefixed));
+    /// A `crc32`-mode slot recording `len`, with a zero checksum.
+    pub(crate) fn crc_slot(len: u32) -> [u8; 16] {
+        let mut slot = [0u8; 16];
+        slot[8..12].copy_from_slice(&len.to_be_bytes());
+        slot
+    }
+
+    fn sig_at(buf: &[u8]) -> u64 {
+        (buf.len() - SIGNATURE.len()) as u64
     }
 
     #[test]
-    fn parse_rejects_a_page_table_that_underflows() {
-        // page_count claims more pages than the buffer could ever hold.
+    fn pages_are_located_by_summing_sizes_backward_from_the_trailer() {
+        let buf = archive(
+            &[(vec![0; 10], crc_slot(100)), (vec![0; 20], crc_slot(200))],
+            b"fsindex",
+        );
+        let layout = parse(&buf.as_slice(), sig_at(&buf)).unwrap();
+
+        let got: Vec<_> = layout
+            .pages
+            .iter()
+            .map(|p| (p.at, p.len, p.declared))
+            .collect();
+        check!(got == [(0, 10, Some(100)), (10, 20, Some(200))]);
+        check!(let Some(BlobRef { at: 70, len: 7, .. }) = layout.fsindex);
+    }
+
+    #[test]
+    fn an_empty_fsindex_means_no_tree() {
+        let buf = archive(&[], b"");
+        let layout = parse(&buf.as_slice(), sig_at(&buf)).unwrap();
+        check!(layout.fsindex.is_none());
+    }
+
+    #[test]
+    fn a_page_count_larger_than_the_file_is_an_underflow() {
         let mut buf = vec![0u8; 9];
-        buf[0..4].copy_from_slice(&0u32.to_be_bytes());
         buf[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
-        let sig_at = 9u64;
-        let mut full = buf;
-        full.extend_from_slice(SIGNATURE);
-        check!(let Err(crate::Error::BadPageTable) = parse(&full.as_slice(), sig_at));
+        buf.extend_from_slice(SIGNATURE);
+        check!(let Err(TrailerError::Underflow { region: "page size table", .. }) = parse(&buf.as_slice(), 9));
     }
 
     #[test]
-    fn parse_rejects_a_signature_too_close_to_the_start() {
+    fn a_signature_too_near_the_start_is_an_underflow() {
         let buf = vec![0u8; 5];
-        check!(let Err(crate::Error::BadPageTable) = parse(&buf.as_slice(), 5));
+        check!(let Err(TrailerError::Underflow { region: "trailer head", .. }) = parse(&buf.as_slice(), 5));
     }
 }

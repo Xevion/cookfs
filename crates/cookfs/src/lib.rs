@@ -1,579 +1,328 @@
-//! cookfs, the page-based Tcl virtual filesystem archive format.
+//! A reader for cookfs, the page-based Tcl virtual filesystem archive.
+//!
+//! cookfs ships in two structurally different formats sharing one directory
+//! tree encoding: `CFS0002`, the frozen legacy format InstallBuilder
+//! installers carry, and `CFS0003`, what upstream writes since 2024. Both
+//! are read transparently.
 
+mod bytes;
 pub mod cache;
 mod codec;
+mod error;
 mod index;
+mod limits;
 mod page;
 mod parsers;
-mod read;
+mod source;
+mod wire;
 
 use positioned_io::{ReadAt, Size};
-use snafu::OptionExt;
+use snafu::{OptionExt, ResultExt, ensure};
 
+use error::error as ctx;
 use index::Index;
-use page::{PageCodec, PageTable};
-use read::{BadBlockSnafu, NoLengthSnafu, PageOutOfRangeSnafu};
+use page::BlobRef;
+use parsers::{cfs0002, cfs0003};
 
+pub use bytes::BytesError;
 pub use cache::{Budget, Page, PageCache};
-/// Compression codec named by a blob's leading id byte, or an explicit id.
-pub use codec::Codec;
-/// One compressed byte range that a file's contents span.
-pub use index::Block;
-/// An arena handle to a [`Node`].
-pub use index::Idx;
-/// What a node in the tree is: a directory of children, or a file's blocks.
-pub use index::Kind;
-/// One entry in the fsindex tree: a file or a directory.
-pub use index::Node;
-/// Everything that can go wrong reading a cookfs archive.
-pub use read::Error;
-/// The crate's result type, defaulting to [`Error`].
-pub use read::Result;
+pub use codec::CodecError;
+pub use error::{Blob, Error, Result};
+pub use index::{Block, Idx, IndexError, Kind, Node};
+pub use limits::Limits;
+pub use parsers::TrailerError;
+pub use parsers::cfs0003::{Encryption, EncryptionMode};
+pub use source::SourceError;
+pub use wire::Compression;
 
 /// Worker count assumed when the OS cannot report available parallelism.
 const WORKERS_FALLBACK: usize = 4;
 
-/// Default ceiling on a decompressed fsindex, in bytes. High enough for any
-/// real archive, low enough that a crafted highly-compressible blob cannot
-/// force a multi-GB allocation before the reader errors.
-const DEFAULT_MAX_FSINDEX_LEN: u32 = 256 * 1024 * 1024;
-
-/// Knobs for [`Archive::open_with`].
-///
-/// New fields may appear in later versions; construct via [`OpenOptions::new`]
-/// or [`OpenOptions::default`] and assign the fields you want to override.
-#[derive(Debug, Clone, Copy)]
+/// What [`Archive::open`] needs to know beyond the source.
+#[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct OpenOptions {
-    /// Ceiling on the decompressed fsindex blob, in bytes.
-    ///
-    /// `CFS0002` does not declare an fsindex uncompressed size on the wire,
-    /// so without a ceiling a highly-compressible blob could inflate to the
-    /// 4 GiB `u32::MAX` bound before the reader errors. This cap acts as a
-    /// defense-in-depth ceiling for both formats, even where a declared size
-    /// exists. Defaults to 256 MiB; raise for archives with unusually large
-    /// directory trees, lower to harden against untrusted input.
-    pub max_fsindex_len: u32,
+    /// Ceilings on what the archive's own bytes can make the reader allocate.
+    pub limits: Limits,
 }
 
-impl OpenOptions {
-    /// A fresh options value at its defaults.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Default for OpenOptions {
-    fn default() -> Self {
-        Self {
-            max_fsindex_len: DEFAULT_MAX_FSINDEX_LEN,
-        }
-    }
-}
-
-/// Which cookfs trailer format an archive was opened as.
-///
-/// Both formats share one directory-tree encoding; this only names the
-/// difference in trailer shape and how a page's codec is recorded.
+/// Which trailer format an archive was opened as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveVersion {
-    /// `CFS0002`: one archive-wide codec byte, per-page id in each blob's
-    /// leading byte.
+    /// `CFS0002`: each blob names its codec in its first byte.
     Cfs0002,
-    /// `CFS0003`: per-page codec named explicitly in a separate pgindex table.
+    /// `CFS0003`: a pgindex names each page's codec.
     Cfs0003,
 }
 
 /// A cookfs archive opened over a random-access source.
 ///
-/// Reads `CFS0002` and `CFS0003` transparently: the format is decided once,
-/// during [`Archive::open`], and every read afterward is version-blind.
-/// Pages are decompressed on demand and held in a bounded cache; nothing is
-/// read up front beyond the trailer and the fsindex.
+/// The format is decided once, in [`Archive::open`]; every read after that
+/// is version-blind. Pages decode on demand into a bounded cache, and nothing
+/// beyond the trailer and the fsindex is read up front.
 pub struct Archive<R> {
     src: R,
     version: ArchiveVersion,
-    pages: PageTable,
+    pages: Vec<BlobRef>,
     index: Index,
     cache: PageCache,
-    encryption: Option<u8>,
+    limits: Limits,
+    encryption: Option<Encryption>,
 }
 
 impl<R: ReadAt + Size> Archive<R> {
-    /// Opens a `CFS0002` or `CFS0003` archive with the default [`OpenOptions`].
+    /// Opens a `CFS0002` or `CFS0003` archive found anywhere in `src`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NoLength`] if `src` cannot report its size,
-    /// [`Error::NoSignature`] if no known trailer parses anywhere in it, or
-    /// any error a format-specific parser or the fsindex parser can produce.
-    pub fn open(src: R) -> Result<Self> {
-        Self::open_with(src, OpenOptions::default())
-    }
+    /// Returns [`Error::Trailer`] when no signature parses as a trailer,
+    /// [`Error::Encrypted`] for an encrypted `CFS0003` archive, and any error
+    /// reading the trailer, decoding the fsindex or parsing its tree.
+    pub fn open(src: R, opts: &OpenOptions) -> Result<Self> {
+        let limits = opts.limits;
+        let len = src
+            .size()
+            .ok()
+            .flatten()
+            .context(source::source_error::NoLength)?;
 
-    /// Opens an archive with caller-supplied [`OpenOptions`].
-    ///
-    /// # Errors
-    ///
-    /// See [`Archive::open`]; additionally, [`Error::Decompress`] if the
-    /// fsindex would decompress to more than `opts.max_fsindex_len` bytes.
-    pub fn open_with(src: R, opts: OpenOptions) -> Result<Self> {
-        let len = src.size().ok().flatten().context(NoLengthSnafu)?;
-
-        let (sig_at, which) = read::find_signature(
+        let (sig_at, which) = source::find_signature(
             &src,
             len,
-            &[parsers::cfs0002::SIGNATURE, parsers::cfs0003::SIGNATURE],
-            |candidate, idx| {
+            &[cfs0002::SIGNATURE, cfs0003::SIGNATURE],
+            |at, idx| {
                 if idx == 0 {
-                    parsers::cfs0002::parse(&src, candidate).is_ok()
+                    cfs0002::parse(&src, at).is_ok()
                 } else {
-                    parsers::cfs0003::Trailer::parse(&src, candidate).is_ok()
+                    cfs0003::Suffix::read(&src, at).is_ok_and(|s| s.fits_before(at))
                 }
             },
-        )?;
+        )?
+        .context(parsers::trailer_error::NoSignature)?;
 
         let (layout, version) = if which == 0 {
-            (
-                parsers::cfs0002::parse(&src, sig_at)?,
-                ArchiveVersion::Cfs0002,
-            )
+            (cfs0002::parse(&src, sig_at)?, ArchiveVersion::Cfs0002)
         } else {
             (
-                parsers::cfs0003::parse(&src, sig_at)?,
+                cfs0003::parse(&src, sig_at, &limits)?,
                 ArchiveVersion::Cfs0003,
             )
         };
 
-        let raw = read::at(&src, layout.fsindex_at, layout.fsindex_len)?;
-        // CFS0002 declares no fsindex uncompressed size; CFS0003 declares one
-        // that could still lie. The cap is the ceiling in both cases.
-        let fsindex_uncompressed_len = layout
-            .fsindex_uncompressed_len
-            .unwrap_or(u32::MAX)
-            .min(opts.max_fsindex_len);
-        let index = Index::parse(&decode_page(
-            &raw,
-            layout.fsindex_codec,
-            fsindex_uncompressed_len,
-        )?)?;
+        if let Some(Encryption { mode, .. }) = layout.encryption {
+            ensure!(mode == EncryptionMode::NONE, ctx::Encrypted { mode });
+        }
 
-        let uncompressed: Vec<u32> = layout
+        let index = match layout.fsindex {
+            Some(blob) => {
+                let raw = source::at(&src, blob.at, blob.len as usize)?;
+                let plain = blob
+                    .decode(&raw, limits.max_fsindex_len)
+                    .context(ctx::Decode {
+                        blob: Blob::Fsindex,
+                    })?;
+                Index::parse(&plain, limits.max_depth)?
+            }
+            None => Index::empty(),
+        };
+        check_blocks(&index, layout.pages.len())?;
+
+        let sizes: Vec<u32> = layout
             .pages
-            .entries
             .iter()
-            .map(|e| e.uncompressed_len)
+            .map(|p| p.declared.unwrap_or(p.len))
             .collect();
         let workers = std::thread::available_parallelism()
             .map_or(WORKERS_FALLBACK, std::num::NonZeroUsize::get);
-        let cache = PageCache::new(Budget::from_pages(&uncompressed, workers));
 
         Ok(Self {
             src,
             version,
             pages: layout.pages,
             index,
-            cache,
+            cache: PageCache::new(Budget::from_pages(&sizes, workers)),
+            limits,
             encryption: layout.encryption,
         })
     }
 
-    /// Which on-disk trailer format this archive was opened as.
+    /// Which trailer format this archive was opened as.
     #[must_use]
-    pub fn version(&self) -> ArchiveVersion {
+    pub const fn version(&self) -> ArchiveVersion {
         self.version
     }
 
-    /// `CFS0003`'s encryption byte, or `None` for a `CFS0002` archive, which
-    /// has none.
-    ///
-    /// Semantics are unconfirmed upstream; both known samples read `0x78`
-    /// and upstream Tcl does not gate behavior on this value. Treat a
-    /// non-zero value as a signal to investigate, not as an error.
+    /// The `CFS0003` encryption mode and level, or `None` for `CFS0002`.
     #[must_use]
-    pub fn encryption(&self) -> Option<u8> {
+    pub const fn encryption(&self) -> Option<Encryption> {
         self.encryption
     }
 
-    fn page(&self, n: usize) -> Result<Page> {
-        let entry = *self.pages.entries.get(n).context(PageOutOfRangeSnafu {
+    fn page(&self, n: u32) -> Result<Page> {
+        let blob = *self.pages.get(n as usize).context(ctx::PageOutOfRange {
             page: n,
-            pages: self.pages.entries.len(),
+            pages: self.pages.len(),
         })?;
-        self.cache.get_or_load(n, || {
-            let raw = read::at(&self.src, entry.offset, entry.compressed_len as usize)?;
-            decode_page(&raw, entry.codec, entry.uncompressed_len)
+        self.cache.get_or_load(n as usize, || {
+            let raw = source::at(&self.src, blob.at, blob.len as usize)?;
+            blob.decode(&raw, self.limits.max_page_len)
+                .context(ctx::Decode {
+                    blob: Blob::Page(n),
+                })
         })
     }
 
-    /// Reads a file node's full decompressed contents.
-    ///
-    /// Returns an empty vector for a directory node.
+    /// Reads a file's full contents, or nothing for a directory.
     ///
     /// # Errors
     ///
-    /// Returns any error the page cache or a page's codec can produce.
+    /// Returns [`Error::Decode`] when a page the file spans fails to decode, and
+    /// [`Error::BlockOutOfPage`] when one of its blocks runs past its page.
     pub fn read(&self, node: Idx<Node>) -> Result<Vec<u8>> {
         let Kind::File(blocks) = &self.index.nodes[node].kind else {
             return Ok(Vec::new());
         };
         let mut out = Vec::with_capacity(self.index.nodes[node].size() as usize);
-        for &block in blocks {
-            snafu::ensure!(
-                block.page >= 0 && block.offset >= 0 && block.size >= 0,
-                BadBlockSnafu {
-                    page: block.page,
-                    offset: block.offset,
-                    size: block.size,
-                }
-            );
-            let page = self.page(block.page as usize)?;
-            let start = (block.offset as usize).min(page.len());
-            let end = (start + block.size as usize).min(page.len());
-            out.extend_from_slice(&page[start..end]);
+        for &Block { page, offset, size } in blocks {
+            let data = self.page(page)?;
+            let range = offset as usize..offset as usize + size as usize;
+            let bytes = data.get(range).context(ctx::BlockOutOfPage {
+                page,
+                offset,
+                size,
+                page_len: data.len(),
+            })?;
+            out.extend_from_slice(bytes);
         }
         Ok(out)
     }
 
-    /// Looks up a node by its arena handle.
+    /// Looks up a node by its handle.
     #[must_use]
     pub fn node(&self, node: Idx<Node>) -> &Node {
         &self.index.nodes[node]
     }
 
-    /// Walks the directory tree depth-first, yielding each node's full path.
+    /// Every node in pre-order, siblings sorted by name, with its full path.
     pub fn walk(&self) -> Vec<(String, Idx<Node>)> {
         self.index.walk()
     }
 }
 
-/// Decodes a page or fsindex blob per its normalized [`PageCodec`].
-///
-/// This is the one place `CFS0002`'s leading-byte convention and `CFS0003`'s
-/// externally-named codec converge: everywhere else, a blob just has a
-/// [`PageCodec`] and this function is how it gets decoded. `uncompressed_len`
-/// is the blob's own declared decompressed size, needed only to bound a raw
-/// LZMA1 stream that carries no end-of-stream marker of its own.
-fn decode_page(blob: &[u8], codec: PageCodec, uncompressed_len: u32) -> Result<Vec<u8>> {
-    let uncompressed_len = uncompressed_len as usize;
-    match codec {
-        PageCodec::Prefixed => codec::decode(blob, uncompressed_len),
-        PageCodec::External(id) => codec::decode_with(id, blob, uncompressed_len),
+/// Refuses a tree that names a page the archive does not hold.
+fn check_blocks(index: &Index, pages: usize) -> Result<()> {
+    for (_, node) in index.nodes.iter() {
+        if let Kind::File(blocks) = &node.kind
+            && let Some(bad) = blocks.iter().find(|b| b.page as usize >= pages)
+        {
+            return ctx::PageOutOfRange {
+                page: bad.page,
+                pages,
+            }
+            .fail();
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use assert2::check;
+    use index::tests::Fsindex;
 
-    /// A codec-`Stored` blob: a leading id byte of 0, then the payload as-is.
+    /// A stored `CFS0002` blob: id byte 0, then the payload.
     fn stored(payload: &[u8]) -> Vec<u8> {
         let mut blob = vec![0u8];
         blob.extend_from_slice(payload);
         blob
     }
 
-    fn file_entry(name: &str, block: Block) -> Vec<u8> {
-        let mut out = vec![name.len() as u8];
-        out.extend_from_slice(name.as_bytes());
-        out.push(0);
-        out.extend_from_slice(&0i64.to_be_bytes()); // mtime
-        out.extend_from_slice(&1i32.to_be_bytes()); // one block
-        out.extend_from_slice(&block.page.to_be_bytes());
-        out.extend_from_slice(&block.offset.to_be_bytes());
-        out.extend_from_slice(&block.size.to_be_bytes());
-        out
+    fn open(buf: Vec<u8>) -> Result<Archive<Vec<u8>>> {
+        Archive::open(buf, &OpenOptions::default())
     }
 
-    /// Builds a complete, minimal CFS0002 archive holding one file at the
-    /// root, everything encoded with the `Stored` codec.
-    fn one_file_archive() -> (Vec<u8>, Vec<u8>) {
-        let payload = b"hello world!".to_vec();
-        let page = stored(&payload);
-
-        let file = file_entry(
-            "hello.txt",
-            Block {
-                page: 0,
-                offset: 0,
-                size: payload.len() as i32,
-            },
+    /// One file, `hello.txt`, holding `payload` in page 0.
+    fn one_file_v2(payload: &[u8]) -> Vec<u8> {
+        let fsindex = Fsindex::new(1)
+            .file("hello.txt", &[(0, 0, payload.len() as i32)])
+            .finish();
+        let page = (
+            stored(payload),
+            cfs0002::tests::crc_slot(payload.len() as u32),
         );
-        let mut fsindex_plain = read::FSINDEX_MAGIC.to_vec();
-        fsindex_plain.extend_from_slice(&1u32.to_be_bytes()); // root has one child
-        fsindex_plain.extend_from_slice(&file);
-        fsindex_plain.extend_from_slice(&0u32.to_be_bytes()); // zero metadata records
-        let fsindex = stored(&fsindex_plain);
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&page); // pages_at == 0
-
-        let mut meta = vec![0u8; 16];
-        meta[8..12].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&meta);
-
-        buf.extend_from_slice(&(page.len() as u32).to_be_bytes());
-
-        buf.extend_from_slice(&fsindex);
-
-        buf.extend_from_slice(&(fsindex.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&1u32.to_be_bytes()); // page_count
-        buf.push(0); // archive-wide codec, informational only
-
-        buf.extend_from_slice(parsers::cfs0002::SIGNATURE);
-
-        (buf, payload)
+        cfs0002::tests::archive(&[page], &stored(&fsindex))
     }
 
-    /// Builds a complete, minimal CFS0003 archive holding one file at the
-    /// root, everything encoded with the `Stored` codec.
-    fn one_file_archive_v3() -> (Vec<u8>, Vec<u8>) {
-        let payload = b"hello v3!".to_vec();
-        let page = payload.clone(); // Stored: no leading id byte at all
-
-        let file = file_entry(
-            "hello.txt",
-            Block {
-                page: 0,
-                offset: 0,
-                size: payload.len() as i32,
-            },
-        );
-        let mut fsindex_plain = read::FSINDEX_MAGIC.to_vec();
-        fsindex_plain.extend_from_slice(&1u32.to_be_bytes());
-        fsindex_plain.extend_from_slice(&file);
-        fsindex_plain.extend_from_slice(&0u32.to_be_bytes());
-        let fsindex = fsindex_plain;
-
-        let mut pgindex = 1u32.to_be_bytes().to_vec();
-        pgindex.push(0); // comprlist: Stored
-        pgindex.push(0); // comprlevellist
-        pgindex.push(0); // encryptionlist
-        pgindex.extend_from_slice(&(page.len() as u32).to_be_bytes());
-        pgindex.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        pgindex.extend_from_slice(&[0u8; 16]); // md5
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&page); // pages_at == 0
-        buf.extend_from_slice(&pgindex);
-        buf.extend_from_slice(&fsindex);
-
-        buf.push(0); // base_compression
-        buf.push(0); // base_compression_level
-        buf.push(0x78); // encryption
-        buf.push(0); // pgindex_compression: Stored
-        buf.push(0); // pgindex_compression_level
-        buf.extend_from_slice(&[0u8; 16]); // pgindex_md5
-        buf.extend_from_slice(&(pgindex.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&(pgindex.len() as u32).to_be_bytes());
-        buf.push(0); // fsindex_compression: Stored
-        buf.push(0); // fsindex_compression_level
-        buf.extend_from_slice(&[0u8; 16]); // fsindex_md5
-        buf.extend_from_slice(&(fsindex.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&(fsindex.len() as u32).to_be_bytes());
-
-        buf.extend_from_slice(parsers::cfs0003::SIGNATURE);
-
-        (buf, payload)
+    fn one_file_v3(payload: &[u8]) -> Vec<u8> {
+        let fsindex = Fsindex::new(1)
+            .file("hello.txt", &[(0, 0, payload.len() as i32)])
+            .finish();
+        cfs0003::tests::archive(&[payload.to_vec()], &fsindex, 0x78)
     }
 
     #[test]
-    fn open_reads_the_trailer_and_walks_the_one_file_it_holds() {
-        let (buf, _) = one_file_archive();
-        let archive = Archive::open(buf).unwrap();
-
-        let paths: Vec<String> = archive.walk().into_iter().map(|(path, _)| path).collect();
-        check!(paths == vec!["hello.txt".to_owned()]);
-    }
-
-    #[test]
-    fn read_returns_the_files_decompressed_bytes() {
-        let (buf, payload) = one_file_archive();
-        let archive = Archive::open(buf).unwrap();
-
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
-        check!(archive.read(idx).unwrap() == payload);
-    }
-
-    #[test]
-    fn node_looks_up_the_file_by_its_handle() {
-        let (buf, payload) = one_file_archive();
-        let archive = Archive::open(buf).unwrap();
-
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
-        let node = archive.node(idx);
-        check!(!node.is_dir());
-        check!(node.size() == payload.len() as u64);
-    }
-
-    #[test]
-    fn open_fails_without_a_signature() {
-        check!(let Err(Error::NoSignature) = Archive::open(vec![0u8; 32]));
-    }
-
-    /// A corrupted archive could hand a caller a block with a negative field;
-    /// the raw `i32 as usize` cast would wrap into a huge value and panic.
-    #[test]
-    fn read_rejects_a_block_with_a_negative_field() {
-        let (buf, _) = one_file_archive();
-        let mut archive = Archive::open(buf).unwrap();
-
-        let root = archive.index.root;
-        let bad = archive.index.nodes.alloc(Node {
-            name: "bad".to_owned(),
-            mtime: 0,
-            parent: Some(root),
-            kind: Kind::File(vec![Block {
-                page: 0,
-                offset: -1,
-                size: 4,
-            }]),
-        });
-
-        check!(let Err(Error::BadBlock { .. }) = archive.read(bad));
-    }
-
-    #[test]
-    fn open_reads_a_cfs0003_archive_and_walks_its_one_file() {
-        let (buf, _) = one_file_archive_v3();
-        let archive = Archive::open(buf).unwrap();
-
-        check!(archive.version() == ArchiveVersion::Cfs0003);
-        let paths: Vec<String> = archive.walk().into_iter().map(|(path, _)| path).collect();
-        check!(paths == vec!["hello.txt".to_owned()]);
-    }
-
-    #[test]
-    fn read_returns_a_cfs0003_files_decompressed_bytes() {
-        let (buf, payload) = one_file_archive_v3();
-        let archive = Archive::open(buf).unwrap();
-
-        let (_, idx) = archive.walk().into_iter().next().unwrap();
-        check!(archive.read(idx).unwrap() == payload);
-    }
-
-    #[test]
-    fn a_cfs0002_archive_reports_its_own_version_and_no_encryption_byte() {
-        let (buf, _) = one_file_archive();
-        let archive = Archive::open(buf).unwrap();
-
+    fn a_cfs0002_file_reads_back_its_bytes() {
+        let archive = open(one_file_v2(b"hello world!")).unwrap();
         check!(archive.version() == ArchiveVersion::Cfs0002);
         check!(archive.encryption().is_none());
+        let (path, idx) = archive.walk().into_iter().next().unwrap();
+        check!(path == "hello.txt");
+        check!(archive.read(idx).unwrap() == b"hello world!");
     }
 
     #[test]
-    fn a_cfs0003_archive_reports_its_own_version_and_encryption_byte() {
-        let (buf, _) = one_file_archive_v3();
-        let archive = Archive::open(buf).unwrap();
-
+    fn a_cfs0003_file_reads_back_its_bytes() {
+        let archive = open(one_file_v3(b"hello v3!")).unwrap();
         check!(archive.version() == ArchiveVersion::Cfs0003);
-        check!(archive.encryption() == Some(0x78));
-    }
-
-    /// A crafted block naming a page past the archive's page count would
-    /// index `self.pages.entries` out of range and panic.
-    #[test]
-    fn read_rejects_a_block_naming_a_page_past_the_archive() {
-        let (buf, _) = one_file_archive();
-        let mut archive = Archive::open(buf).unwrap();
-
-        let root = archive.index.root;
-        let bad = archive.index.nodes.alloc(Node {
-            name: "bad".to_owned(),
-            mtime: 0,
-            parent: Some(root),
-            kind: Kind::File(vec![Block {
-                page: 42,
-                offset: 0,
-                size: 4,
-            }]),
-        });
-
-        check!(let Err(Error::PageOutOfRange { .. }) = archive.read(bad));
-    }
-
-    /// Builds a CFS0002 archive whose fsindex uses a deflate-compressed blob.
-    ///
-    /// The archive holds no pages and an empty root directory; its fsindex
-    /// plaintext is `FSINDEX_MAGIC + 0_children + 0_metadata` = 16 bytes.
-    fn cfs0002_with_deflate_fsindex() -> Vec<u8> {
-        use flate2::Compression;
-        use flate2::write::DeflateEncoder;
-        use std::io::Write;
-
-        let mut fsindex_plain = read::FSINDEX_MAGIC.to_vec();
-        fsindex_plain.extend_from_slice(&0u32.to_be_bytes()); // no children
-        fsindex_plain.extend_from_slice(&0u32.to_be_bytes()); // no metadata
-
-        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&fsindex_plain).unwrap();
-        let deflated = enc.finish().unwrap();
-
-        let mut fsindex = vec![1u8]; // codec id 1: deflate
-        fsindex.extend_from_slice(&deflated);
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&fsindex);
-        buf.extend_from_slice(&(fsindex.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&0u32.to_be_bytes()); // page_count
-        buf.push(0); // archive-wide codec, informational
-        buf.extend_from_slice(parsers::cfs0002::SIGNATURE);
-        buf
-    }
-
-    #[test]
-    fn open_options_default_caps_fsindex_at_256_mib() {
-        check!(OpenOptions::default().max_fsindex_len == 256 * 1024 * 1024);
-    }
-
-    #[test]
-    fn open_with_a_generous_cap_reads_a_deflated_fsindex() {
-        let buf = cfs0002_with_deflate_fsindex();
-        let opts = OpenOptions {
-            max_fsindex_len: 1024,
-            ..OpenOptions::default()
-        };
-        let archive = Archive::open_with(buf, opts).unwrap();
-        check!(archive.walk().is_empty());
-    }
-
-    /// A cap smaller than the fsindex plaintext must error instead of silently
-    /// truncating; the decoder's own bounded read would otherwise let a bomb
-    /// past as an apparently-clean decompression.
-    #[test]
-    fn open_with_a_tiny_cap_errors_on_the_fsindex_decode() {
-        let buf = cfs0002_with_deflate_fsindex();
-        let opts = OpenOptions {
-            max_fsindex_len: 4,
-            ..OpenOptions::default()
-        };
         check!(
-            let Err(Error::DecompressBomb { codec: "deflate", limit: 4 })
-                = Archive::open_with(buf, opts)
+            archive.encryption()
+                == Some(Encryption {
+                    mode: EncryptionMode::NONE,
+                    level: 15
+                })
         );
+        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        check!(archive.read(idx).unwrap() == b"hello v3!");
     }
 
-    /// A crafted block whose offset runs past the page would slice-index the
-    /// page with `start > page.len()` and panic on the range.
     #[test]
-    fn read_survives_a_block_whose_offset_runs_past_the_page() {
-        let (buf, _) = one_file_archive();
-        let mut archive = Archive::open(buf).unwrap();
+    fn an_encrypted_cfs0003_archive_is_refused_rather_than_misread() {
+        let fsindex = Fsindex::new(0).finish();
+        let buf = cfs0003::tests::archive(&[], &fsindex, 0x79);
+        check!(let Err(Error::Encrypted { mode: EncryptionMode::FILE }) = open(buf));
+    }
 
-        let root = archive.index.root;
-        let bad = archive.index.nodes.alloc(Node {
-            name: "bad".to_owned(),
-            mtime: 0,
-            parent: Some(root),
-            kind: Kind::File(vec![Block {
-                page: 0,
-                offset: 9_999,
-                size: 4,
-            }]),
-        });
+    #[test]
+    fn a_source_without_a_signature_is_refused() {
+        check!(let Err(Error::Trailer { source: TrailerError::NoSignature }) = open(vec![0u8; 32]));
+    }
 
-        check!(archive.read(bad).unwrap().is_empty());
+    #[test]
+    fn a_block_naming_a_missing_page_is_refused_at_open() {
+        let fsindex = Fsindex::new(1).file("f", &[(5, 0, 1)]).finish();
+        let buf = cfs0002::tests::archive(&[], &stored(&fsindex));
+        check!(let Err(Error::PageOutOfRange { page: 5, pages: 0 }) = open(buf));
+    }
+
+    #[test]
+    fn a_block_running_past_its_page_is_an_error() {
+        let fsindex = Fsindex::new(1).file("f", &[(0, 8, 9)]).finish();
+        let page = (stored(b"0123456789"), cfs0002::tests::crc_slot(10));
+        let archive = open(cfs0002::tests::archive(&[page], &stored(&fsindex))).unwrap();
+        let (_, idx) = archive.walk().into_iter().next().unwrap();
+        check!(let Err(Error::BlockOutOfPage { page: 0, page_len: 10, .. }) = archive.read(idx));
+    }
+
+    #[test]
+    fn an_fsindex_over_the_limit_is_refused() {
+        let opts = OpenOptions {
+            limits: Limits {
+                max_fsindex_len: 4,
+                ..Limits::default()
+            },
+        };
+        let check = Archive::open(one_file_v2(b"x"), &opts);
+        check!(let Err(Error::Decode { blob: Blob::Fsindex, source: CodecError::TooLarge { limit: 4, .. } }) = check);
     }
 }

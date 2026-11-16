@@ -1,386 +1,314 @@
-//! `CFS0003` trailer, pgindex, and page-table parsing.
+//! The `CFS0003` trailer, the format upstream cookfs writes since 2024.
 //!
-//! `CFS0003` moves per-page compression out of each page blob and into a
-//! separate pgindex table, itself a compressed blob whose own compression id
-//! and size live in the trailer. The trailer is fixed-size (55 bytes, plus
-//! the 7-byte signature): unlike `CFS0002`, nothing about its own shape
-//! depends on the page count.
+//! Per-page codecs and sizes move out of the blobs into a pgindex, itself a
+//! compressed blob that the fixed-size suffix describes:
 //!
-//! Byte layout verified against upstream Tcl:
-//! <https://github.com/chpock/cookfs/blob/main/scripts/pages.tcl#L366-L443>
+//! ```text
+//! [pages][pgindex][fsindex][55-byte suffix]["CFS0003"][encryption data]
+//! ```
+//!
+//! The encryption data after the signature is absent unless the archive is
+//! encrypted. Layout verified against upstream `generic/pages.c`.
 
 use positioned_io::ReadAt;
-use snafu::OptionExt;
+use snafu::ResultExt;
+use zerocopy::byteorder::big_endian::U32;
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use crate::codec::{self, Codec};
-use crate::page::{Layout, PageCodec, PageEntry, PageTable};
-use crate::read::{BadPageTableSnafu, Cursor, MAX_PREALLOC, Result, at};
+use super::{TrailerError, before, trailer_error};
+use crate::Limits;
+use crate::bytes::Reader;
+use crate::page::{BlobRef, Codec, Layout};
+use crate::source;
+use crate::wire::Compression;
 
-/// The seven bytes that mark the end of a `CFS0003` trailer.
+/// The seven bytes that end a `CFS0003` suffix.
 pub(crate) const SIGNATURE: &[u8] = b"CFS0003";
 
-/// Bytes of fixed trailer fields preceding the signature (55 + 7 = 62 total).
-const TRAILER_LEN: u64 = 55;
-
-/// The fixed fields behind a `CFS0003` signature, before the pgindex and
-/// fsindex blobs are read.
-#[derive(Debug)]
-pub(crate) struct Trailer {
-    /// Archive-wide compression id. Not currently used; every page and the
-    /// fsindex name their own codec.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "parsed for completeness; every blob names its own codec id"
-        )
-    )]
-    pub base_compression: u8,
-    /// Archive-wide compression level.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "parsed for completeness and round-trip tested; not needed to build a Layout"
-        )
-    )]
-    pub base_compression_level: u8,
-    /// Semantics unconfirmed upstream; both known samples read `0x78` and
-    /// upstream Tcl does not gate behavior on this value.
-    pub encryption: u8,
-    /// Compression id of the pgindex blob.
-    pub pgindex_compression: u8,
-    /// Compression level of the pgindex blob.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "parsed for completeness and round-trip tested; not needed to build a Layout"
-        )
-    )]
-    pub pgindex_compression_level: u8,
-    /// MD5 digest of the decompressed pgindex blob.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "parsed for completeness and round-trip tested; not needed to build a Layout"
-        )
-    )]
-    pub pgindex_md5: [u8; 16],
-    /// Compressed length of the pgindex blob.
-    pub pgindex_size_compressed: u32,
-    /// Decompressed length of the pgindex blob.
-    pub pgindex_size_uncompressed: u32,
-    /// Compression id of the fsindex blob.
-    pub fsindex_compression: u8,
-    /// Compression level of the fsindex blob.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "parsed for completeness and round-trip tested; not needed to build a Layout"
-        )
-    )]
-    pub fsindex_compression_level: u8,
-    /// MD5 digest of the decompressed fsindex blob.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "parsed for completeness and round-trip tested; not needed to build a Layout"
-        )
-    )]
-    pub fsindex_md5: [u8; 16],
-    /// Compressed length of the fsindex blob.
-    pub fsindex_size_compressed: u32,
-    /// Decompressed length of the fsindex blob.
-    pub fsindex_size_uncompressed: u32,
+/// Compression, level, hash and sizes of the pgindex or fsindex blob.
+#[derive(Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+pub(crate) struct BlobInfo {
+    compression: u8,
+    level: u8,
+    md5: [u8; 16],
+    size_compressed: U32,
+    size_uncompressed: U32,
 }
 
-impl Trailer {
-    /// Parses the fixed trailer fields behind a `CFS0003` signature at `sig_at`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::BadPageTable`] if `sig_at` is too close to the
-    /// start of the source to hold a full trailer, or [`crate::Error::Io`] if
-    /// a read runs past the source's bounds.
-    pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Self> {
-        let trailer_at = sig_at.checked_sub(TRAILER_LEN).context(BadPageTableSnafu)?;
-        let buf = at(src, trailer_at, TRAILER_LEN as usize)?;
-        let mut c = Cursor::new(&buf);
+/// The fixed fields before the signature.
+#[derive(Clone, Copy, FromBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+pub(crate) struct Suffix {
+    base_compression: u8,
+    base_level: u8,
+    encryption: u8,
+    pgindex: BlobInfo,
+    fsindex: BlobInfo,
+}
 
-        Ok(Self {
-            base_compression: c.u8()?,
-            base_compression_level: c.u8()?,
-            encryption: c.u8()?,
-            pgindex_compression: c.u8()?,
-            pgindex_compression_level: c.u8()?,
-            pgindex_md5: c.take(16)?.try_into().unwrap_or_else(|_| unreachable!()),
-            pgindex_size_compressed: c.be32()?,
-            pgindex_size_uncompressed: c.be32()?,
-            fsindex_compression: c.u8()?,
-            fsindex_compression_level: c.u8()?,
-            fsindex_md5: c.take(16)?.try_into().unwrap_or_else(|_| unreachable!()),
-            fsindex_size_compressed: c.be32()?,
-            fsindex_size_uncompressed: c.be32()?,
+#[expect(
+    unreachable_pub,
+    reason = "bitbybit makes the accessors it generates `pub`"
+)]
+mod encryption_byte {
+    use arbitrary_int::{u3, u5};
+    use bitbybit::bitfield;
+
+    /// The suffix's encryption byte: a mode in the low three bits, the key-derivation level above.
+    #[bitfield(u8)]
+    pub(super) struct EncryptionByte {
+        #[bits(3..=7, r)]
+        level: u5,
+        #[bits(0..=2, r)]
+        mode: u3,
+    }
+}
+
+use encryption_byte::EncryptionByte;
+
+crate::wire::wire_enum! {
+    /// How a `CFS0003` archive is encrypted.
+    pub struct EncryptionMode(u8) {
+        /// Not encrypted.
+        NONE = 0,
+        /// Pages encrypted with a key derived from the password.
+        FILE = 1,
+        /// Pages encrypted with a random key, itself encrypted by the password.
+        KEY = 2,
+        /// As [`Self::KEY`], with the pgindex and fsindex encrypted too.
+        KEY_INDEX = 3,
+    }
+}
+
+/// A `CFS0003` archive's encryption mode and key-derivation level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Encryption {
+    /// The mode.
+    pub mode: EncryptionMode,
+    /// The PBKDF2 level, 0 to 31; upstream's default is 15.
+    pub level: u8,
+}
+
+impl From<u8> for Encryption {
+    fn from(raw: u8) -> Self {
+        let byte = EncryptionByte::new_with_raw_value(raw);
+        Self {
+            mode: EncryptionMode::from_raw(byte.mode().value()),
+            level: byte.level().value(),
+        }
+    }
+}
+
+const SUFFIX_LEN: u64 = size_of::<Suffix>() as u64;
+
+/// The smallest pgindex record: id, level and encryption bytes, two sizes, and a hash.
+const PGINDEX_RECORD_LEN: usize = 1 + 1 + 1 + 4 + 4 + 16;
+
+impl Suffix {
+    /// Reads the fixed suffix behind a `CFS0003` signature at `sig_at`.
+    pub(crate) fn read<R: ReadAt>(src: &R, sig_at: u64) -> Result<Self, TrailerError> {
+        let at = before("trailer suffix", sig_at, SUFFIX_LEN)?;
+        let raw = source::at(src, at, SUFFIX_LEN as usize).context(trailer_error::Read)?;
+        Self::read_from_bytes(&raw).map_err(|_| TrailerError::Underflow {
+            region: "trailer suffix",
+            len: SUFFIX_LEN,
+            end: sig_at,
         })
     }
-}
 
-/// Per-page codec ids and sizes decoded from a `CFS0003` pgindex blob.
-#[derive(Debug)]
-pub(crate) struct PgIndex {
-    /// Per-page compression id, in page order.
-    pub compr: Vec<u8>,
-    /// Per-page compressed length, in page order.
-    pub size_compressed: Vec<u32>,
-    /// Per-page decompressed length, in page order.
-    pub size_uncompressed: Vec<u32>,
-}
-
-impl PgIndex {
-    /// Parses a decompressed pgindex blob's page arrays.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::Truncated`] if the blob is shorter than its
-    /// own declared page count requires.
-    pub(crate) fn parse(blob: &[u8]) -> Result<Self> {
-        let mut c = Cursor::new(blob);
-        let page_count = c.be32()? as usize;
-
-        let compr = c.take(page_count)?.to_vec();
-        c.take(page_count)?; // per-page compression level, unused
-        c.take(page_count)?; // per-page encryption flag, unused
-
-        let cap = page_count.min(MAX_PREALLOC);
-        let mut size_compressed = Vec::with_capacity(cap);
-        for _ in 0..page_count {
-            size_compressed.push(c.be32()?);
-        }
-        let mut size_uncompressed = Vec::with_capacity(cap);
-        for _ in 0..page_count {
-            size_uncompressed.push(c.be32()?);
-        }
-        c.take(page_count * 16)?; // per-page md5, unused
-
-        Ok(Self {
-            compr,
-            size_compressed,
-            size_uncompressed,
-        })
+    /// Whether the pgindex and fsindex this suffix describes fit before it, as upstream checks before trusting it.
+    pub(crate) fn fits_before(&self, sig_at: u64) -> bool {
+        let indexes = u64::from(self.pgindex.size_compressed.get())
+            + u64::from(self.fsindex.size_compressed.get());
+        indexes + SUFFIX_LEN <= sig_at
     }
 }
 
-/// Parses the trailer, pgindex, and page table behind a `CFS0003` signature.
-///
-/// Unlike [`Trailer::parse`], this decompresses the pgindex blob, so it
-/// should only run once a candidate signature is already confirmed.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::BadPageTable`] if any length-prefixed field would
-/// place a region before offset 0, [`crate::Error::UnknownCodec`] if a page
-/// or the pgindex itself names an unrecognised codec id, and any error the
-/// pgindex codec's decoder can produce.
-pub(crate) fn parse<R: ReadAt>(src: &R, sig_at: u64) -> Result<Layout> {
-    let trailer = Trailer::parse(src, sig_at)?;
-    let trailer_at = sig_at.checked_sub(TRAILER_LEN).context(BadPageTableSnafu)?;
+/// Parses the suffix, pgindex and page table behind a `CFS0003` signature.
+pub(crate) fn parse<R: ReadAt>(
+    src: &R,
+    sig_at: u64,
+    limits: &Limits,
+) -> Result<Layout, TrailerError> {
+    let suffix = Suffix::read(src, sig_at)?;
+    let suffix_at = sig_at - SUFFIX_LEN;
 
-    let fsindex_at = trailer_at
-        .checked_sub(u64::from(trailer.fsindex_size_compressed))
-        .context(BadPageTableSnafu)?;
-    let pgindex_at = fsindex_at
-        .checked_sub(u64::from(trailer.pgindex_size_compressed))
-        .context(BadPageTableSnafu)?;
+    let fsindex_len = suffix.fsindex.size_compressed.get();
+    let fsindex_at = before("fsindex", suffix_at, fsindex_len.into())?;
+    let pgindex_len = suffix.pgindex.size_compressed.get();
+    let pgindex_at = before("pgindex", fsindex_at, pgindex_len.into())?;
 
-    let pgindex_raw = at(src, pgindex_at, trailer.pgindex_size_compressed as usize)?;
-    let pgindex_codec = Codec::from_id(trailer.pgindex_compression)?;
-    let pgindex_plain = codec::decode_with(
-        pgindex_codec,
-        &pgindex_raw,
-        trailer.pgindex_size_uncompressed as usize,
-    )?;
-    let pgindex = PgIndex::parse(&pgindex_plain)?;
-
-    let total_compressed: u64 = pgindex.size_compressed.iter().map(|&s| u64::from(s)).sum();
-    let pages_at = pgindex_at
-        .checked_sub(total_compressed)
-        .context(BadPageTableSnafu)?;
-
-    let mut offset = pages_at;
-    let mut entries = Vec::with_capacity(pgindex.compr.len());
-    for i in 0..pgindex.compr.len() {
-        entries.push(PageEntry {
-            offset,
-            compressed_len: pgindex.size_compressed[i],
-            uncompressed_len: pgindex.size_uncompressed[i],
-            codec: PageCodec::External(Codec::from_id(pgindex.compr[i])?),
-        });
-        offset += u64::from(pgindex.size_compressed[i]);
-    }
-
-    let fsindex_codec = Codec::from_id(trailer.fsindex_compression)?;
+    let pages = if pgindex_len == 0 {
+        Vec::new()
+    } else {
+        let pgindex = blob(pgindex_at, suffix.pgindex);
+        let raw = source::at(src, pgindex_at, pgindex_len as usize).context(trailer_error::Read)?;
+        let plain = pgindex
+            .decode(&raw, limits.max_page_len)
+            .context(trailer_error::PgindexBlob)?;
+        page_table(&plain, pgindex_at)?
+    };
 
     Ok(Layout {
-        pages: PageTable { entries },
-        fsindex_at,
-        fsindex_len: trailer.fsindex_size_compressed as usize,
-        fsindex_uncompressed_len: Some(trailer.fsindex_size_uncompressed),
-        fsindex_codec: PageCodec::External(fsindex_codec),
-        encryption: Some(trailer.encryption),
+        pages,
+        fsindex: (fsindex_len > 0).then(|| blob(fsindex_at, suffix.fsindex)),
+        encryption: Some(Encryption::from(suffix.encryption)),
     })
 }
 
+const fn blob(at: u64, info: BlobInfo) -> BlobRef {
+    BlobRef {
+        at,
+        len: info.size_compressed.get(),
+        codec: Codec::External(Compression::from_raw(info.compression)),
+        declared: Some(info.size_uncompressed.get()),
+    }
+}
+
+/// Decodes the pgindex's struct-of-arrays into pages ending at `end`.
+///
+/// ```text
+/// u32 N, N x u8 compression, N x u8 level, N x u8 encrypted,
+/// N x u32 compressed size, N x u32 uncompressed size, N x 16-byte MD5
+/// ```
+fn page_table(plain: &[u8], end: u64) -> Result<Vec<BlobRef>, TrailerError> {
+    let mut r = Reader::new(plain);
+    let count = r
+        .record::<U32>()
+        .context(trailer_error::PgindexLayout)?
+        .get();
+    let n = r
+        .check_count(count, PGINDEX_RECORD_LEN)
+        .context(trailer_error::PgindexLayout)?;
+
+    let compression = r.take(n).context(trailer_error::PgindexLayout)?;
+    r.take(n).context(trailer_error::PgindexLayout)?; // levels
+    r.take(n).context(trailer_error::PgindexLayout)?; // encryption flags
+    let compressed = r
+        .records::<U32>(count)
+        .context(trailer_error::PgindexLayout)?;
+    let uncompressed = r
+        .records::<U32>(count)
+        .context(trailer_error::PgindexLayout)?;
+    r.records::<[u8; 16]>(count)
+        .context(trailer_error::PgindexLayout)?;
+
+    let total: u64 = compressed.iter().map(|s| u64::from(s.get())).sum();
+    let mut at = before("page data", end, total)?;
+
+    Ok(compression
+        .iter()
+        .zip(compressed)
+        .zip(uncompressed)
+        .map(|((&id, len), declared)| {
+            let page = BlobRef {
+                at,
+                len: len.get(),
+                codec: Codec::External(Compression::from_raw(id)),
+                declared: Some(declared.get()),
+            };
+            at += u64::from(len.get());
+            page
+        })
+        .collect())
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use assert2::check;
 
-    /// One trailer blob descriptor: compression id, MD5, and both sizes.
-    #[derive(Clone, Copy)]
-    struct BlobDescriptor {
-        compression: u8,
-        md5: [u8; 16],
-        size_compressed: u32,
-        size_uncompressed: u32,
-    }
-
-    impl BlobDescriptor {
-        fn zero() -> Self {
-            Self {
-                compression: 0,
-                md5: [0u8; 16],
-                size_compressed: 0,
-                size_uncompressed: 0,
-            }
-        }
-    }
-
-    /// Appends the 55 fixed trailer bytes for the given field values.
-    fn push_trailer(
-        buf: &mut Vec<u8>,
-        pgindex: BlobDescriptor,
-        fsindex: BlobDescriptor,
-        encryption: u8,
-    ) {
-        buf.push(1); // base_compression
-        buf.push(6); // base_compression_level
-        buf.push(encryption);
-        buf.push(pgindex.compression);
-        buf.push(9); // pgindex_compression_level
-        buf.extend_from_slice(&pgindex.md5);
-        buf.extend_from_slice(&pgindex.size_compressed.to_be_bytes());
-        buf.extend_from_slice(&pgindex.size_uncompressed.to_be_bytes());
-        buf.push(fsindex.compression);
-        buf.push(9); // fsindex_compression_level
-        buf.extend_from_slice(&fsindex.md5);
-        buf.extend_from_slice(&fsindex.size_compressed.to_be_bytes());
-        buf.extend_from_slice(&fsindex.size_uncompressed.to_be_bytes());
-    }
-
-    #[test]
-    fn trailer_parses_an_empty_archive_with_zero_pages() {
-        let mut buf = Vec::new();
-        push_trailer(&mut buf, BlobDescriptor::zero(), BlobDescriptor::zero(), 0);
-        let sig_at = buf.len() as u64;
-        buf.extend_from_slice(SIGNATURE);
-
-        let trailer = Trailer::parse(&buf.as_slice(), sig_at).unwrap();
-        check!(trailer.pgindex_size_compressed == 0);
-        check!(trailer.fsindex_size_compressed == 0);
-        check!(trailer.encryption == 0);
-    }
-
-    #[test]
-    fn trailer_round_trips_pgindex_and_fsindex_descriptors() {
-        let pgindex_md5 = [0xAAu8; 16];
-        let fsindex_md5 = [0xBBu8; 16];
-        let pgindex = BlobDescriptor {
-            compression: 2,
-            md5: pgindex_md5,
-            size_compressed: 58,
-            size_uncompressed: 100,
-        };
-        let fsindex = BlobDescriptor {
-            compression: 3,
-            md5: fsindex_md5,
-            size_compressed: 200,
-            size_uncompressed: 500,
-        };
-        let mut buf = Vec::new();
-        push_trailer(&mut buf, pgindex, fsindex, 0x78);
-        let sig_at = buf.len() as u64;
-        buf.extend_from_slice(SIGNATURE);
-
-        let trailer = Trailer::parse(&buf.as_slice(), sig_at).unwrap();
-        check!(trailer.base_compression == 1);
-        check!(trailer.base_compression_level == 6);
-        check!(trailer.encryption == 0x78);
-        check!(trailer.pgindex_compression == 2);
-        check!(trailer.pgindex_compression_level == 9);
-        check!(trailer.pgindex_md5 == pgindex_md5);
-        check!(trailer.pgindex_size_compressed == 58);
-        check!(trailer.pgindex_size_uncompressed == 100);
-        check!(trailer.fsindex_compression == 3);
-        check!(trailer.fsindex_compression_level == 9);
-        check!(trailer.fsindex_md5 == fsindex_md5);
-        check!(trailer.fsindex_size_compressed == 200);
-        check!(trailer.fsindex_size_uncompressed == 500);
-    }
-
-    #[test]
-    fn trailer_rejects_a_signature_too_close_to_the_start() {
-        let buf = vec![0u8; 10];
-        check!(let Err(crate::Error::BadPageTable) = Trailer::parse(&buf.as_slice(), 10));
-    }
-
-    fn pgindex_blob(compr: &[u8], size_compressed: &[u32], size_uncompressed: &[u32]) -> Vec<u8> {
-        let n = compr.len();
+    /// A stored pgindex blob describing `pages` as `(compressed, uncompressed)` sizes.
+    pub(crate) fn pgindex(pages: &[(u32, u32)]) -> Vec<u8> {
+        let n = pages.len();
         let mut blob = (n as u32).to_be_bytes().to_vec();
-        blob.extend_from_slice(compr);
-        blob.extend_from_slice(&vec![6u8; n]); // comprlevellist
-        blob.extend_from_slice(&vec![0u8; n]); // encryptionlist
-        for &s in size_compressed {
-            blob.extend_from_slice(&s.to_be_bytes());
+        blob.extend(std::iter::repeat_n(0u8, 3 * n)); // stored, level 0, not encrypted
+        for &(c, _) in pages {
+            blob.extend_from_slice(&c.to_be_bytes());
         }
-        for &s in size_uncompressed {
-            blob.extend_from_slice(&s.to_be_bytes());
+        for &(_, u) in pages {
+            blob.extend_from_slice(&u.to_be_bytes());
         }
-        blob.extend_from_slice(&vec![0u8; n * 16]); // md5
+        blob.extend(std::iter::repeat_n(0u8, 16 * n));
         blob
     }
 
-    #[test]
-    fn pgindex_parses_comprlist_and_sizes_for_two_pages() {
-        let blob = pgindex_blob(&[3, 0], &[100, 200], &[50, 150]);
-        let idx = PgIndex::parse(&blob).unwrap();
-        check!(idx.compr == vec![3, 0]);
-        check!(idx.size_compressed == vec![100, 200]);
-        check!(idx.size_uncompressed == vec![50, 150]);
+    /// Builds a `CFS0003` archive with stored pages and a stored fsindex.
+    pub(crate) fn archive(pages: &[Vec<u8>], fsindex: &[u8], encryption: u8) -> Vec<u8> {
+        let sizes: Vec<_> = pages
+            .iter()
+            .map(|p| (p.len() as u32, p.len() as u32))
+            .collect();
+        let pgindex = pgindex(&sizes);
+
+        let mut buf: Vec<u8> = pages.concat();
+        buf.extend_from_slice(&pgindex);
+        buf.extend_from_slice(fsindex);
+        buf.extend_from_slice(&[0, 0, encryption]);
+        for len in [pgindex.len(), fsindex.len()] {
+            buf.extend_from_slice(&[0, 0]);
+            buf.extend_from_slice(&[0; 16]);
+            buf.extend_from_slice(&(len as u32).to_be_bytes());
+            buf.extend_from_slice(&(len as u32).to_be_bytes());
+        }
+        buf.extend_from_slice(SIGNATURE);
+        buf
+    }
+
+    fn sig_at(buf: &[u8]) -> u64 {
+        (buf.len() - SIGNATURE.len()) as u64
     }
 
     #[test]
-    fn pgindex_parses_zero_pages() {
-        let blob = pgindex_blob(&[], &[], &[]);
-        let idx = PgIndex::parse(&blob).unwrap();
-        check!(idx.compr.is_empty());
+    fn the_suffix_is_fifty_five_bytes() {
+        check!(SUFFIX_LEN == 55);
     }
 
     #[test]
-    fn pgindex_errors_instead_of_panicking_on_truncation() {
-        let mut blob = pgindex_blob(&[3, 0], &[100, 200], &[50, 150]);
-        blob.truncate(blob.len() - 5);
-        check!(let Err(crate::Error::Truncated { .. }) = PgIndex::parse(&blob));
+    fn pages_are_located_before_the_pgindex() {
+        let buf = archive(&[vec![1; 10], vec![2; 20]], b"fsindex", 0);
+        let layout = parse(&buf.as_slice(), sig_at(&buf), &Limits::default()).unwrap();
+        let got: Vec<_> = layout.pages.iter().map(|p| (p.at, p.len)).collect();
+        check!(got == [(0, 10), (10, 20)]);
     }
 
-    /// A crafted page count must not force a multi-GB pre-allocation; the
-    /// cursor's next take errors on missing bytes long before it matters.
     #[test]
-    fn pgindex_rejects_a_crafted_page_count_without_oom() {
-        let blob = u32::MAX.to_be_bytes().to_vec();
-        check!(let Err(crate::Error::Truncated { .. }) = PgIndex::parse(&blob));
+    fn the_encryption_byte_splits_into_mode_and_level() {
+        check!(
+            Encryption::from(0x78)
+                == Encryption {
+                    mode: EncryptionMode::NONE,
+                    level: 15
+                }
+        );
+        check!(
+            Encryption::from(0x7B)
+                == Encryption {
+                    mode: EncryptionMode::KEY_INDEX,
+                    level: 15
+                }
+        );
+    }
+
+    #[test]
+    fn an_empty_pgindex_and_fsindex_describe_an_empty_archive() {
+        let mut buf = vec![0u8; 55];
+        buf.extend_from_slice(SIGNATURE);
+        let layout = parse(&buf.as_slice(), 55, &Limits::default()).unwrap();
+        check!(layout.pages.is_empty());
+        check!(layout.fsindex.is_none());
+    }
+
+    #[test]
+    fn a_pgindex_count_larger_than_its_blob_is_refused() {
+        let blob = u32::MAX.to_be_bytes();
+        check!(let Err(TrailerError::PgindexLayout { .. }) = page_table(&blob, 1 << 40));
+    }
+
+    #[test]
+    fn a_suffix_too_near_the_start_is_an_underflow() {
+        let buf = vec![0u8; 10];
+        check!(let Err(TrailerError::Underflow { region: "trailer suffix", .. }) = Suffix::read(&buf.as_slice(), 10));
     }
 }
