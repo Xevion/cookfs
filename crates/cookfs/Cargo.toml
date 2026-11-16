@@ -38,11 +38,16 @@ zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 assert2.workspace = true
+divan.workspace = true
 libtest-mimic.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 toml.workspace = true
 zip.workspace = true
+
+[[bench]]
+name = "read"
+harness = false
 
 # One case per corpus sample, so it runs under its own harness.
 [[test]]

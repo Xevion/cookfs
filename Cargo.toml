@@ -15,6 +15,7 @@ assert2 = "0.4.1"
 bitbybit = "2.0.1"
 brotli = "8.0.4"
 crc32fast = "1.5.1"
+divan = "0.1.21"
 bzip2 = "0.6.1"
 cbc = { version = "0.2.1", default-features = false }
 flate2 = "1.1.9"
