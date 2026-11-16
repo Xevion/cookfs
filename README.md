@@ -15,6 +15,22 @@ starkits.
 | [`metakit`](crates/metakit) | The database holding the bootstrap and manifest |
 | [`bitrock`](crates/bitrock) | The installer, composing both |
 
+`metakit` and `bitrock` are placeholders for now; `cookfs` is the one that reads anything.
+
+## Development
+
+Tasks run through [tempo](https://github.com/Xevion/tempo). `tempo check` is the gate: formatting,
+clippy, docs, tests, licences, unused dependencies and workflow lints.
+
+The tests check every archive against what upstream Tcl cookfs reads from it. The fixtures in
+`crates/cookfs/tests/fixtures` are checked in; the corpus of real installers is not:
+
+- `tempo corpus -- pull` fetches the corpus listed in `corpus.toml` (needs the `S3_*` values in
+  `.env`). Without it, the corpus tests skip.
+- `tempo oracle -- build` builds upstream cookfs, and `tempo oracle -- dump` lists the corpus
+  through it. `tempo oracle -- fixtures` regenerates the fixtures (needs Tcl).
+- `tempo fuzz -- <target>` runs a fuzz target; see `fuzz/README.md`.
+
 ## License
 
 MIT

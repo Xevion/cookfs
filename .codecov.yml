@@ -3,7 +3,7 @@ codecov:
     wait_for_ci: true
 
 # Informational: both statuses post a number and never fail a check. Coverage is a trend to read;
-# the gate is `just check`.
+# the gate is `tempo check`.
 coverage:
   status:
     project:
