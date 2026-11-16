@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-11-16
 
 ### Breaking
 
@@ -66,8 +66,8 @@
 - A file whose blocks cycle through pages stops with `Error::Overdecoded` instead of
   decoding a page per block.
 - Nested directory counts no longer reserve memory the blob cannot fill.
-- A `KEY_INDEX` archive is reported as `Error::Encrypted`, not as a corrupt pgindex.
-- A page the pgindex flags as encrypted is refused instead of returned as plaintext.
+- A page the pgindex flags as encrypted, in an archive holding no key, is refused instead of
+  returned as ciphertext.
 - A name repeated in one directory keeps its last entry, as upstream does, and a file and
   directory sharing a name are refused.
 - Names decode as the Tcl runtime that wrote them reads them: `C0 80` is NUL, a CESU-8
@@ -80,7 +80,6 @@
 - A `CFS0003` page declared empty is empty without decoding.
 - A zstd frame can no longer make the decoder allocate a window larger than the output it
   may produce, and large-window brotli, which upstream refuses, is refused.
-- `Limits::max_depth` admits that many nested directories; it allowed one fewer.
 
 ## 0.1.0 (2026-08-24)
 

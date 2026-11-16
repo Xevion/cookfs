@@ -4,7 +4,9 @@ description = "cookfs, the page-based Tcl virtual filesystem archive embedded in
 keywords = ["cookfs", "tcl", "vfs", "archive", "installbuilder"]
 categories = ["filesystem", "compression"]
 readme = "README.md"
-version = "0.1.0"
+# Fixtures and the corpus harness need the workspace around them, so they stay out of the package.
+exclude = ["tests/", "proptest-regressions/"]
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
