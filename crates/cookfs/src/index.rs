@@ -229,7 +229,7 @@ impl Index {
             }
             if let Some(count) = children {
                 ensure!(
-                    open.len() < max_depth,
+                    open.len() <= max_depth,
                     index_error::TooDeep { limit: max_depth }
                 );
                 open.push((idx, count));

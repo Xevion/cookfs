@@ -48,7 +48,8 @@
 - Bytes after the last pgindex record are refused, as upstream does.
 - A blob naming a codec its format cannot hold is refused: zstd or brotli in `CFS0002`,
   BitRock's LZMA slot in `CFS0003`.
-- A page declared empty is empty without decoding.
+- A `CFS0003` page declared empty is empty without decoding.
+- `Limits::max_depth` admits that many nested directories; it allowed one fewer.
 
 ## 0.1.0 (2026-08-24)
 
