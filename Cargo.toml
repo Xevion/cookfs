@@ -23,7 +23,7 @@ la-arena = "0.3.1"
 liblzma = "0.4.8"
 md-5 = { version = "0.11.0", default-features = false }
 libtest-mimic = "0.8.2"
-lru = "0.18.2"
+lru = "0.19.0"
 parking_lot = "0.13.0"
 pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 positioned-io = "0.3.5"
