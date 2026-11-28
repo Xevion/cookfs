@@ -1,9 +1,9 @@
 [tools]
-bun = "1.4.0"
+bun = "1.4.5"
 # Opts out of aube's download-count gate, which fails the whole install where CI cannot confirm.
 "npm:@xevion/tempo" = { version = "latest", allow_low_downloads = true }
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.143"
-"aqua:taiki-e/cargo-llvm-cov" = "0.9.0"
-"aqua:zizmorcore/zizmor" = "1.29.0"
-"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
-"github:bnjbvr/cargo-machete" = { version = "0.10.0", os = ["linux"] }
+"aqua:taiki-e/cargo-llvm-cov" = "0.9.2"
+"aqua:zizmorcore/zizmor" = "1.33.1"
+"aqua:EmbarkStudios/cargo-deny" = "0.22.0"
+"github:bnjbvr/cargo-machete" = { version = "0.10.1", os = ["linux"] }
